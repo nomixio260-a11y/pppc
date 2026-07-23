@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ANP — Autonomous Network Protocol</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>ANP <span class="sub">Autonomous Network Protocol</span></h1>
+    <p class="tagline">ブラウザ完結型・招待制・分散ホストネットワーク</p>
+  </header>
+
+  <!-- ======================= Setup ======================= -->
+  <section id="setup" hidden>
+    <div class="card">
+      <h2>新しいネットワークを作成</h2>
+      <p class="muted">Genesis 鍵ペアを生成し、その公開鍵のハッシュが固定の Network ID になります。</p>
+      <label>ニックネーム <input id="create-nickname" placeholder="creator" /></label>
+      <label>Relay (1行に1つ)
+        <textarea id="create-relays" rows="2" placeholder="ws://localhost:8787"></textarea>
+      </label>
+      <button id="btn-create" class="primary">ネットワークを作成して参加</button>
+    </div>
+
+    <div class="card">
+      <h2>招待を受けて参加</h2>
+      <ol class="muted small">
+        <li>「参加リクエストコードを作成」を押し、表示されたコードを招待者に渡す</li>
+        <li>招待者から受け取った招待バンドルを貼り付けて参加する</li>
+      </ol>
+      <button id="btn-request">1. 参加リクエストコードを作成</button>
+      <textarea id="request-code" rows="3" readonly hidden></textarea>
+      <p id="request-hint" class="muted small" hidden>↑ このコード(あなたの公開鍵)を招待者に送ってください。秘密鍵はこのブラウザから出ません。</p>
+      <label>ニックネーム <input id="join-nickname" placeholder="member" /></label>
+      <label>招待バンドル
+        <textarea id="join-bundle" rows="4" placeholder="招待者から受け取った文字列を貼り付け"></textarea>
+      </label>
+      <button id="btn-join" class="primary">2. 検証して参加</button>
+    </div>
+  </section>
+
+  <!-- ======================= Main ======================= -->
+  <section id="main" hidden>
+    <div class="card">
+      <h2>ネットワーク</h2>
+      <div class="kv">
+        <div><span>固定URL</span><code id="net-url"></code>
+          <button id="btn-copy-url" class="mini">コピー</button></div>
+        <div><span>Node ID</span><code id="net-node-id" class="wrap"></code></div>
+        <div><span>ニックネーム</span><b id="net-nickname"></b></div>
+        <div><span>役割</span><span id="net-role"></span></div>
+        <div><span>権限</span><span id="net-rights"></span></div>
+      </div>
+      <h3>Relay</h3>
+      <ul id="relay-list" class="plain"></ul>
+      <div class="row">
+        <button id="btn-leave">LEAVE を送信して切断</button>
+        <button id="btn-reset" class="danger">identity を完全削除</button>
+      </div>
+    </div>
+
+    <div class="card" id="invite-card" hidden>
+      <h2>招待を発行</h2>
+      <p class="muted small">相手の参加リクエストコード(公開鍵)を貼り付けると、署名済み招待バンドルを発行します。</p>
+      <label>参加リクエストコード <input id="invite-pubkey" placeholder="04..." /></label>
+      <label class="inline"><input type="checkbox" id="invite-grant" /> 招待権も付与する</label>
+      <button id="btn-issue" class="primary">招待バンドルを発行</button>
+      <textarea id="invite-bundle" rows="4" readonly hidden></textarea>
+    </div>
+
+    <div class="card">
+      <h2>参加者 <span class="badge">P2P接続 <b id="peer-count">0</b></span></h2>
+      <ul id="peer-list" class="plain"></ul>
+    </div>
+
+    <div class="card">
+      <h2>service/chat <span class="badge">CRDT</span></h2>
+      <div id="chat-box"></div>
+      <div class="row">
+        <input id="chat-input" placeholder="メッセージ (WebRTC DataChannel で直接送信)" />
+        <button id="btn-send" class="primary">送信</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Name Service <span class="badge">署名付きレコード複製</span></h2>
+      <table>
+        <thead><tr><th>name</th><th>value</th><th>ver</th><th>ttl</th><th>author</th></tr></thead>
+        <tbody id="ns-body"></tbody>
+      </table>
+      <div class="row">
+        <input id="ns-name" placeholder="service/chat" />
+        <input id="ns-value" placeholder='{"kind":"node-set","nodes":["..."]}' />
+        <button id="btn-ns-publish">公開</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>ログ</h2>
+      <pre id="log"></pre>
+    </div>
+  </section>
+
+  <footer class="muted small">
+    固定URL → Network ID → 招待証明書 → Relayで発見 → WebRTCで直接接続 → P2Pメッシュ → Name Service
+  </footer>
+
+  <script type="module" src="/anp.js"></script>
+</body>
+</html>

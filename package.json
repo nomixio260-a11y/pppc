@@ -1,0 +1,26 @@
+{
+  "name": "anp",
+  "version": "1.0.0",
+  "description": "ANP: Autonomous Network Protocol - browser-based, invite-only, distributed host network",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run typecheck && node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "relay": "tsx src/relay/server.ts",
+    "start": "npm run build && npm run relay",
+    "test": "node --import tsx --test test/*.test.ts",
+    "test:e2e": "node test/e2e.browser.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "esbuild": "^0.24.0",
+    "playwright-core": "^1.61.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
