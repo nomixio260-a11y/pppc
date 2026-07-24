@@ -56,7 +56,7 @@ export type DcMessage =
 export interface MeshCallbacks {
   publishEvent: (event: AnpEvent) => void;
   onPeerOpen: (peer: PeerInfo) => void;
-  onPeerClose: (nodeId: NodeId) => void;
+  onPeerClose: (nodeId: NodeId, reason?: string) => void;
   onMessage: (from: NodeId, msg: DcMessage) => void;
   log: (line: string) => void;
 }
@@ -240,7 +240,7 @@ export class Mesh {
       if (state === "failed" || state === "closed") {
         this.dropLink(nodeId, link, `pc ${state}`);
         this.recordFailure(nodeId);
-        this.cb.onPeerClose(nodeId);
+        this.cb.onPeerClose(nodeId, `pc ${state}`);
       }
     };
     return link;
@@ -409,7 +409,7 @@ export class Mesh {
         if (Date.now() - link.lastPongAt > PONG_DEADLINE_MS) {
           this.dropLink(nodeId, link, "keepalive timeout");
           this.recordFailure(nodeId);
-          this.cb.onPeerClose(nodeId);
+          this.cb.onPeerClose(nodeId, "keepalive timeout");
           return;
         }
         this.sendOn(link, { t: "PING", ts: Date.now() });
@@ -442,7 +442,7 @@ export class Mesh {
       if (this.links.get(nodeId) !== link) return;
       this.dropLink(nodeId, link, "datachannel closed");
       this.recordFailure(nodeId);
-      this.cb.onPeerClose(nodeId);
+      this.cb.onPeerClose(nodeId, "datachannel closed");
     };
   }
 

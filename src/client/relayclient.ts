@@ -58,23 +58,36 @@ export class RelayPool {
   constructor(private readonly opts: RelayClientOptions) {}
 
   start(): void {
-    for (const url of this.opts.urls) {
-      const conn: RelayConn = {
+    for (const url of this.opts.urls) this.addRelay(url);
+  }
+
+  /** Add and connect a relay at runtime (bootstrap adoption / manual edit). */
+  addRelay(url: string): void {
+    if (this.closed || this.conns.has(url)) return;
+    const conn: RelayConn = {
+      url,
+      attempts: 0,
+      queue: [],
+      stats: {
         url,
-        attempts: 0,
-        queue: [],
-        stats: {
-          url,
-          connected: false,
-          eventsReceived: 0,
-          eventsAccepted: 0,
-          eventsRejected: 0,
-          lastEventAt: 0,
-        },
-      };
-      this.conns.set(url, conn);
-      this.connect(conn);
-    }
+        connected: false,
+        eventsReceived: 0,
+        eventsAccepted: 0,
+        eventsRejected: 0,
+        lastEventAt: 0,
+      },
+    };
+    this.conns.set(url, conn);
+    this.connect(conn);
+  }
+
+  /** Remove a relay at runtime (manual edit). */
+  removeRelay(url: string): void {
+    const conn = this.conns.get(url);
+    if (!conn) return;
+    if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
+    conn.ws?.close();
+    this.conns.delete(url);
   }
 
   stop(): void {

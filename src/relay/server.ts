@@ -36,8 +36,26 @@ import { nowSeconds } from "../shared/crypto.js";
 import type { AnpEvent, ClientFrame, EventFilter, RelayFrame } from "../shared/types.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST ?? "0.0.0.0";
 const POW_REQUIRED_BITS = Number(process.env.ANP_POW_BITS ?? POW_BITS);
+/**
+ * When behind a reverse proxy / tunnel (e.g. Cloudflare Tunnel), the socket
+ * address is the proxy, so per-IP limits must key on the forwarded client IP.
+ * Off by default (a direct-facing relay must NOT trust client-set headers).
+ */
+const TRUST_PROXY = process.env.ANP_TRUST_PROXY === "1";
 const PUBLIC_DIR = new URL("../../public", import.meta.url).pathname;
+
+/** Client IP for rate-limiting: forwarded header when trusted, else socket. */
+function clientIp(req: IncomingMessage): string {
+  if (TRUST_PROXY) {
+    const fwd = req.headers["cf-connecting-ip"] ?? req.headers["x-forwarded-for"];
+    const raw = Array.isArray(fwd) ? fwd[0] : fwd;
+    const first = raw?.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  return req.socket.remoteAddress ?? "unknown";
+}
 
 const MAX_EVENTS_PER_NETWORK = 5000;
 /** cap for a node's stored discovery events (JOIN/HEARTBEAT/LEAVE/MANIFEST) */
@@ -338,7 +356,7 @@ const restBuckets = new Map<string, TokenBucket>();
 setInterval(() => restBuckets.clear(), 10 * 60_000).unref();
 
 function restBucket(req: IncomingMessage): TokenBucket {
-  const key = req.socket.remoteAddress ?? "unknown";
+  const key = clientIp(req);
   let bucket = restBuckets.get(key);
   if (!bucket) {
     bucket = new TokenBucket();
@@ -432,7 +450,7 @@ wss.on("connection", (ws, req) => {
     ws.close(1013, "server busy");
     return;
   }
-  const ip = req.socket.remoteAddress ?? "unknown";
+  const ip = clientIp(req);
   // per-IP cap: one source can't monopolize the global slots or multiply its
   // rate/CPU budget by opening many connections
   if ((connsPerIp.get(ip) ?? 0) >= MAX_CONNECTIONS_PER_IP) {
@@ -532,9 +550,10 @@ setInterval(() => {
   }
 }, PING_INTERVAL_MS).unref();
 
-httpServer.listen(PORT, () => {
-  console.log(`[anp-relay] listening on http://localhost:${PORT}`);
-  console.log(`[anp-relay] ws endpoint  ws://localhost:${PORT}`);
+httpServer.listen(PORT, HOST, () => {
+  console.log(`[anp-relay] listening on http://${HOST}:${PORT}`);
+  console.log(`[anp-relay] ws endpoint  ws://${HOST}:${PORT}`);
   console.log(`[anp-relay] client UI    http://localhost:${PORT}/`);
   console.log(`[anp-relay] join PoW     ${POW_REQUIRED_BITS} bits`);
+  console.log(`[anp-relay] trust proxy  ${TRUST_PROXY}`);
 });

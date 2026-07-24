@@ -80,6 +80,7 @@ import { AnpStore } from "./store.js";
 import { RelayPool } from "./relayclient.js";
 import { Mesh, type DcMessage } from "./webrtc.js";
 import { FileService } from "./files.js";
+import { BAN_THRESHOLD, Reputation, type PeerScore } from "../shared/reputation.js";
 
 interface NodeConfig {
   network_id: string;
@@ -169,6 +170,7 @@ let myNodeId = "";
 let pool: RelayPool | undefined;
 let mesh: Mesh | undefined;
 let files: FileService | undefined;
+let reputation = new Reputation();
 let chatLog: GSetLog | undefined;
 let profileMap: LwwMap | undefined;
 let nameService: NameServiceStore | undefined;
@@ -331,8 +333,13 @@ async function mergeNsRecords(records: NameRecord[], from?: NodeId): Promise<boo
     // isCertRevoked at chain-verification time; the structural validity
     // (author binding, value shape) is enforced inside NameServiceStore.merge.
     const isRevocation = record.name.startsWith(REVOKED_PREFIX);
+    if (isRevocation && !isValidRevocationRecord(record)) {
+      // a malformed record squatting the revoked/ namespace is an attack signal
+      if (from) reputation.record(from, "bad-revocation");
+      continue;
+    }
     const allowed = isRevocation
-      ? isValidRevocationRecord(record) && isPlausibleRevoker(record.author_pubkey)
+      ? isPlausibleRevoker(record.author_pubkey)
       : isAuthorizedNsAuthor(record.author_pubkey);
     if (!allowed) continue;
     if (await nameService.merge(record)) merged.push(record);
@@ -340,11 +347,39 @@ async function mergeNsRecords(records: NameRecord[], from?: NodeId): Promise<boo
   if (merged.length) {
     await persistNs();
     await applyRevocations();
+    await adoptBootstrapRelays();
     renderNs();
     // gossip newly-won records onward (terminates: re-merge returns false)
     mesh?.broadcast({ t: "NS", records: merged }, from);
   }
   return merged.length > 0;
+}
+
+/**
+ * Bootstrap relay adoption (design doc §10.2): the genesis node publishes a
+ * signed `bootstrap` relay-set. Non-genesis nodes adopt any new relays from
+ * it, so the network can migrate/add relays WITHOUT changing the fixed URL.
+ * Only the genesis-authored record is trusted, and we only ever ADD relays
+ * (never drop the operator's own), keeping connectivity resilient.
+ */
+async function adoptBootstrapRelays(): Promise<void> {
+  if (!config || !nameService || !pool || config.is_genesis) return;
+  const boot = nameService.resolve("bootstrap");
+  if (!boot || boot.author_pubkey !== genesisPubkeyHex()) return;
+  const value = boot.value as { kind?: string; relays?: unknown };
+  if (value?.kind !== "relay-set" || !Array.isArray(value.relays)) return;
+  const advertised = value.relays.filter(
+    (r): r is string => typeof r === "string" && /^wss?:\/\//.test(r),
+  );
+  const fresh = advertised.filter((r) => !config!.relays.includes(r)).slice(0, 8);
+  if (fresh.length === 0) return;
+  config.relays = [...config.relays, ...fresh];
+  await store.put("kv", "config", config);
+  for (const url of fresh) {
+    pool.addRelay(url);
+    log(`adopted bootstrap relay: ${url}`);
+  }
+  renderRelays();
 }
 
 /** Re-check every member and live peer against the latest revocation set. */
@@ -605,6 +640,12 @@ async function startNode(): Promise<void> {
   }
   revocations = nameService.revocations();
 
+  // trust scores (Phase 4): persisted per peer, decayed on every restart
+  reputation = Reputation.fromJSON(await store.all<PeerScore>("peers"));
+  reputation.onChange = (record) => {
+    void store.put("peers", record.node_id, record);
+  };
+
   // publish own (signed) nickname cell
   const nickKey = `nickname/${myNodeId}`;
   if (profileMap.get(nickKey) !== config.nickname) {
@@ -616,6 +657,7 @@ async function startNode(): Promise<void> {
   mesh = new Mesh(config.network_id, nodeKeys, ecdhKey, myNodeId, {
     publishEvent: (event) => pool?.publish(event),
     onPeerOpen: (peer) => {
+      reputation.record(peer.node_id, "connect");
       sendHello(peer.node_id);
       if (chatLog && profileMap) {
         mesh?.send(peer.node_id, {
@@ -626,11 +668,21 @@ async function startNode(): Promise<void> {
       }
       renderPeers();
     },
-    onPeerClose: () => renderPeers(),
+    onPeerClose: (nodeId, reason) => {
+      if (reason === "keepalive timeout") reputation.record(nodeId, "keepalive-timeout");
+      else if (reason?.startsWith("pc ")) reputation.record(nodeId, "pc-failed");
+      renderPeers();
+    },
     onMessage: (from, msg) => void handleDcMessage(from, msg),
     log,
   });
-  files = new FileService(store, mesh, log);
+  files = new FileService(store, mesh, log, {
+    rankPeers: (ids) => reputation.rank(ids),
+    onOutcome: (peer, ok) => {
+      reputation.record(peer, ok ? "file-served" : "file-failed");
+      renderPeers();
+    },
+  });
 
   pool = new RelayPool({
     urls: config.relays,
@@ -737,6 +789,9 @@ async function publishManifest(): Promise<void> {
 async function handleRelayEvent(event: AnpEvent): Promise<void> {
   if (!mesh || !nameService) return;
 
+  // trust score enforcement: fully ignore peers at or below the ban line
+  if (event.node_id !== myNodeId && reputation.isBanned(event.node_id)) return;
+
   if (event.type === "JOIN" && event.node_id !== myNodeId) {
     // relayclient verified signature/chain; additionally enforce revocations
     const join = event as JoinEvent;
@@ -820,10 +875,18 @@ async function acceptChatEntries(from: NodeId, entries: LogEntry[]): Promise<voi
   // bound work per delta: a peer cannot force an unbounded ECDSA-verify storm
   const batch = (entries ?? []).slice(0, MAX_ENTRIES_PER_DELTA);
   const mergeable: LogEntry[] = [];
+  let anyValid = false;
   for (const entry of batch) {
     if (typeof entry?.id !== "string") continue;
-    if (!validEntryData(entry)) continue; // malformed shape
-    if (!(await verifyLogEntry(entry))) continue; // forged or unsigned
+    if (!validEntryData(entry)) {
+      reputation.record(from, "forged-entry"); // malformed shape from this peer
+      continue;
+    }
+    if (!(await verifyLogEntry(entry))) {
+      reputation.record(from, "forged-entry"); // bad signature / origin binding
+      continue;
+    }
+    anyValid = true;
     const originNode = replicaNodeId(entry.origin);
     if (originNode === myNodeId || members.has(originNode)) {
       mergeable.push(entry);
@@ -845,6 +908,7 @@ async function acceptChatEntries(from: NodeId, entries: LogEntry[]): Promise<voi
       requestProof(originNode, from);
     }
   }
+  if (anyValid) reputation.record(from, "valid-sync");
   const added = chatLog.merge(mergeable);
   if (added.length) {
     await persistChat();
@@ -857,6 +921,12 @@ async function acceptChatEntries(from: NodeId, entries: LogEntry[]): Promise<voi
 
 async function handleDcMessage(from: NodeId, msg: DcMessage): Promise<void> {
   if (!mesh || !chatLog || !profileMap || !nameService || !files) return;
+
+  // trust score enforcement: drop the link and ignore banned peers entirely
+  if (reputation.isBanned(from)) {
+    mesh.removePeer(from);
+    return;
+  }
 
   if (await files.handleMessage(from, msg)) return;
 
@@ -1138,10 +1208,41 @@ function renderRelays(): void {
   const parts = pool.statsSnapshot().map((s) => {
     const age = s.lastEventAt ? `${now - s.lastEventAt}s前` : "—";
     const err = s.lastError ? ` <span class="ng-text">${escapeHtml(s.lastError)}</span>` : "";
+    const canDrop = (config?.relays.length ?? 0) > 1;
+    const rm = canDrop
+      ? `<button class="mini relay-rm" data-url="${escapeHtml(s.url)}">削除</button>`
+      : "";
     return `<li><span class="dot ${s.connected ? "ok" : "ng"}"></span>${escapeHtml(s.url)}
-      <span class="muted small">受信 ${s.eventsReceived} / 最終 ${age}${err}</span></li>`;
+      <span class="muted small">受信 ${s.eventsReceived} / 最終 ${age}${err}</span> ${rm}</li>`;
   });
   $("relay-list").innerHTML = parts.join("");
+  for (const btn of $("relay-list").querySelectorAll<HTMLButtonElement>(".relay-rm")) {
+    btn.onclick = () => void removeRelay(btn.dataset["url"]!);
+  }
+}
+
+async function addRelayUrl(url: string): Promise<void> {
+  if (!config || !pool) return;
+  if (!/^wss?:\/\//.test(url)) throw new Error("Relay URL は ws:// または wss:// で始まる必要があります");
+  if (config.relays.includes(url)) throw new Error("既に追加済みです");
+  config.relays = [...config.relays, url];
+  await store.put("kv", "config", config);
+  pool.addRelay(url);
+  renderRelays();
+  toast(`Relay を追加しました: ${url}`, "ok");
+}
+
+async function removeRelay(url: string): Promise<void> {
+  if (!config || !pool) return;
+  if (config.relays.length <= 1) {
+    toast("最後のRelayは削除できません", "error");
+    return;
+  }
+  config.relays = config.relays.filter((r) => r !== url);
+  await store.put("kv", "config", config);
+  pool.removeRelay(url);
+  renderRelays();
+  toast(`Relay を削除しました: ${url}`, "info");
 }
 
 function nicknameOf(nodeId: NodeId): string {
@@ -1167,10 +1268,26 @@ function renderPeers(): void {
       const verified = members.has(peer.node_id)
         ? `<span class="badge ok-badge">検証済み</span>`
         : `<span class="badge">未検証</span>`;
-      return `<li><b>${escapeHtml(nicknameOf(peer.node_id))}</b> <code>${short(peer.node_id)}</code> ${state} ${verified}</li>`;
+      const score = Math.round(reputation.scoreOf(peer.node_id));
+      const banned = reputation.isBanned(peer.node_id);
+      const trustClass = banned ? "ng-text" : score > 0 ? "ok-badge" : "";
+      const trust = `<span class="badge ${trustClass}" title="信頼スコア (ローカル)">信頼 ${score}${banned ? " ⛔" : ""}</span>`;
+      const reset = score !== 0
+        ? `<button class="mini trust-reset" data-id="${escapeHtml(peer.node_id)}">リセット</button>`
+        : "";
+      return `<li><b>${escapeHtml(nicknameOf(peer.node_id))}</b> <code>${short(peer.node_id)}</code> ${state} ${verified} ${trust} ${reset}</li>`;
     });
   $("peer-list").innerHTML = rows.join("") || `<li class="muted">他の参加者はまだいません</li>`;
   $("peer-count").textContent = String(connected.size);
+  for (const btn of $("peer-list").querySelectorAll<HTMLButtonElement>(".trust-reset")) {
+    btn.onclick = () => {
+      const id = btn.dataset["id"]!;
+      reputation.reset(id);
+      void store.delete("peers", id);
+      renderPeers();
+      toast("信頼スコアをリセットしました", "ok");
+    };
+  }
 }
 
 function renderChat(): void {
@@ -1266,6 +1383,10 @@ async function boot(): Promise<void> {
   if (!config) {
     $("setup").hidden = false;
     $("main").hidden = true;
+    // prefill the relay box with the default for THIS origin, so a user on a
+    // tunnel/https deploy gets the correct wss:// relay automatically
+    const relayBox = $("create-relays") as HTMLTextAreaElement;
+    if (!relayBox.value.trim()) relayBox.value = defaultRelays().join("\n");
     applyInviteHash();
     return;
   }
@@ -1410,6 +1531,14 @@ function wireUi(): void {
     if (!name) return;
     await publishRecord(name, value);
     toast(`${name} を公開しました`, "ok");
+  });
+
+  busyWrap($("btn-relay-add") as HTMLButtonElement, async () => {
+    const input = $("relay-add-url") as HTMLInputElement;
+    const url = input.value.trim();
+    if (!url) return;
+    await addRelayUrl(url);
+    input.value = "";
   });
 
   busyWrap($("btn-export") as HTMLButtonElement, () => exportIdentity());

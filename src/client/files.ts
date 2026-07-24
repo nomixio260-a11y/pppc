@@ -38,6 +38,13 @@ interface IncomingTransfer {
   timer: ReturnType<typeof setTimeout>;
 }
 
+export interface FileServiceHooks {
+  /** reorder candidate providers (e.g. by trust score, best first) */
+  rankPeers?: (ids: NodeId[]) => NodeId[];
+  /** observe per-peer transfer outcomes (feeds the reputation system) */
+  onOutcome?: (peer: NodeId, ok: boolean) => void;
+}
+
 export class FileService {
   /** cid -> in-flight download */
   private incoming = new Map<string, IncomingTransfer>();
@@ -46,6 +53,7 @@ export class FileService {
     private readonly store: AnpStore,
     private readonly mesh: Mesh,
     private readonly log: (line: string) => void,
+    private readonly hooks: FileServiceHooks = {},
   ) {}
 
   async cidOfBytes(bytes: Uint8Array): Promise<string> {
@@ -75,16 +83,19 @@ export class FileService {
   async fetchBlob(cid: string): Promise<Uint8Array> {
     const local = await this.localBlob(cid);
     if (local) return local;
-    const peers = this.mesh.connectedNodeIds();
+    let peers = this.mesh.connectedNodeIds();
+    if (this.hooks.rankPeers) peers = this.hooks.rankPeers(peers);
     if (peers.length === 0) throw new Error("接続中のピアがいません");
     let lastError = "no provider";
     for (const peer of peers) {
       try {
         const bytes = await this.requestFrom(peer, cid);
         await this.store.put("blobs", cid, bytes.buffer);
+        this.hooks.onOutcome?.(peer, true);
         return bytes;
       } catch (err) {
         lastError = (err as Error).message;
+        this.hooks.onOutcome?.(peer, false);
       }
     }
     throw new Error(`取得失敗: ${lastError}`);

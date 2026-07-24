@@ -1,0 +1,58 @@
+name: ANP Demo (Cloudflare Tunnel)
+
+# Manually launch a public ANP demo. The relay runs inside the Actions runner
+# and is exposed through a Cloudflare Tunnel; the public URL is printed to the
+# job summary. Nothing is deployed or left running after the job ends.
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "デモを起動しておく分数 (最大 340 / GitHub のジョブ上限内)"
+        required: true
+        default: "30"
+      pow_bits:
+        description: "JOIN の proof-of-work 難易度 (bits)"
+        required: true
+        default: "12"
+
+# Only one live demo at a time; a new run cancels the previous tunnel.
+concurrency:
+  group: anp-demo
+  cancel-in-progress: true
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    # hard ceiling; the script also self-stops after duration_minutes
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck & test
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Launch demo through Cloudflare Tunnel
+        env:
+          PORT: "8787"
+          ANP_POW_BITS: ${{ github.event.inputs.pow_bits }}
+          DURATION: ${{ fromJSON(github.event.inputs.duration_minutes) * 60 }}
+          # Optional: set repo secret CF_TUNNEL_TOKEN for a stable named tunnel.
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          CF_PUBLIC_URL: ${{ vars.CF_PUBLIC_URL }}
+        run: bash scripts/demo.sh

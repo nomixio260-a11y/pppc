@@ -17,6 +17,16 @@ npm start          # ビルドして Relay + クライアントUI を起動
 # → http://localhost:8787/ をブラウザで開く
 ```
 
+### 公開デモ（GitHub Actions + Cloudflare Tunnel）
+
+中央サーバーを常設せずに、一時的な公開デモを起動できる。GitHub の **Actions → "ANP Demo (Cloudflare Tunnel)" → Run workflow** を実行すると、Actions ランナー内で Relay が起動し、Cloudflare Tunnel 経由で公開URL（`https://<ランダム>.trycloudflare.com`）がジョブサマリーに表示される。そのURLを複数のブラウザ/プロファイルで開けば招待制P2Pネットワークを試せる。指定した分数が過ぎるとトンネルは自動停止する。
+
+- 難易度と起動時間は Run workflow の入力で指定
+- 安定したホスト名が欲しい場合はリポジトリシークレット `CF_TUNNEL_TOKEN`（named tunnel のトークン）と変数 `CF_PUBLIC_URL` を設定
+- ローカルでも同じことができる: `cloudflared` を入れて `DURATION=1800 bash scripts/demo.sh`
+
+Tunnel の背後では全クライアントが同一送信元IPに見えるため、Relay は `ANP_TRUST_PROXY=1` のとき `CF-Connecting-IP` / `X-Forwarded-For` を使ってIP毎レート制限を正しく効かせる（直接公開時はヘッダを信用しない安全側がデフォルト）。
+
 複数ノードを試すには、同じURLを **別のブラウザプロファイル**（またはシークレットウィンドウ）で開く。IndexedDB がプロファイルごとに分かれるため、それぞれが独立ノードになる。
 
 1. ブラウザA: 「ネットワークを作成して参加」→ Genesis 鍵と Network ID が生成される
@@ -31,10 +41,11 @@ npm start          # ビルドして Relay + クライアントUI を起動
 | コマンド | 説明 |
 |---|---|
 | `npm run build` | 型チェック + クライアントバンドル生成 (`public/anp.js`) |
-| `npm run relay` | Relay サーバー起動（`PORT`、`ANP_POW_BITS` 環境変数対応） |
+| `npm run relay` | Relay サーバー起動（`PORT` / `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY` 環境変数対応） |
 | `npm start` | build + relay |
-| `npm test` | ユニット + Relay 統合テスト（52件） |
+| `npm test` | ユニット + Relay 統合テスト（61件） |
 | `npm run test:e2e` | 実ブラウザ3ノードE2E（要 Chromium、Relay自動起動） |
+| `bash scripts/demo.sh` | Relay起動 + Cloudflare Tunnel で公開（`cloudflared` 必要、`DURATION`秒） |
 
 ## 構成
 
@@ -46,9 +57,10 @@ src/shared/    ブラウザ・Node 共通（Web Crypto ベース）
   identity.ts     Network ID / Node ID / 招待証明書チェーン（権限昇格防止・
                   長さ上限・失効対応）/ 招待バンドル
   events.ts       JOIN(PoW付き) / HEARTBEAT / LEAVE / MANIFEST / SIGNAL(E2E暗号)
-  nameservice.ts  署名付きレコード集合（決定的マージ・TTL・失効レコード抽出）
+  nameservice.ts  署名付きレコード集合（決定的マージ・TTL・著者別失効レコード抽出）
   crdt.ts         GSetLog（バージョンベクトル同期・エポックorigin）と LwwMap、
                   エントリ/セルの署名・検証
+  reputation.ts   ローカル信頼スコア（挙動観測→加点/減点・遮断・プロバイダ順位）
 src/relay/     Relay サーバー（保存・検索・配布のみ。サービス本体ではない）
   server.ts       WebSocket (EVENT/REQ/EOSE/OK/NOTICE) + REST + TTL sweep +
                   署名/PoW検証 + メンバーシップゲート + レート制限 + 静的配信
@@ -104,6 +116,14 @@ Node ID が辞書順で小さい側が offer を出す（glare 回避、防御�
 
 失効は**複数著者の加算的・単調集合**として扱う。各失効レコードは著者ごとに独立した名前 `revoked/<invite_id>/<author_pubkey>` を持ち、著者束縛（名前の著者セグメント == レコード署名者）と値検証（`{kind:"revocation"}` のみ）を merge 時に強制する。これにより、任意のメンバーが高versionレコードで他者の失効枠を上書き・消去して失効を無効化する攻撃（LWW squatting）を構造的に排除している。失効が実際に効力を持つのは、著者が当該証明書の発行者または Genesis 鍵の場合のみ（`isCertRevoked`）。
 
+### 信頼スコア（§14.4, Phase 4）
+
+各ノードは他ピアの**ローカルな**信頼スコアを持つ（合意もゴシップもしないので、スコア自体が攻撃対象にならない）。挙動を観測して加減点する: 接続成功・有効な同期・ファイル配信で加点、偽造/未署名エントリ・不正な失効レコード・転送失敗・keepalive切れで減点。閾値（-50）を下回ったピアは完全に無視され（接続も処理もしない）、リンクは切断される。ファイル取得時は高スコアのプロバイダを優先。スコアは IndexedDB に永続化され、再起動ごとに 0 方向へ減衰するので、一時的な問題や古い遮断は時間とともに回復する。UIにスコアを表示し、手動リセットも可能。
+
+### Relay の動的追加・ブートストラップ採用
+
+UIから Relay を追加・削除でき、Genesis ノードが署名して公開する `bootstrap` レコード（relay-set）を非Genesisノードが自動採用する。これにより**固定URLを変えずに**ネットワークが Relay を移行・増設できる（Genesis著者のレコードのみ信用し、既存Relayは落とさず追加のみ）。
+
 ### DataChannel の認証について
 
 DataChannel を確立した SDP は宛先ノード鍵に暗号化されているため、チャネルの対端はその鍵の保持者であることが暗黙に認証される。さらに CRDT ペイロードはエントリ単位で署名される（二重の防御）。
@@ -122,10 +142,13 @@ DataChannel を確立した SDP は宛先ノード鍵に暗号化されている
 | 8 | エポック付きorigin | 同一identityの複数セッションによるCRDT分岐を構造的に排除 |
 | 9 | 履歴専用メンバーシップ | 証明書期限切れメンバーの過去ログを新規ノードでも検証可能に |
 | 10 | 招待リンク / identity エクスポート・インポート / sendBeacon LEAVE | 実運用のUX |
+| 11 | ローカル信頼スコア（Phase 4） | 挙動観測で悪意ノードを自動遮断・プロバイダ選好 |
+| 12 | Relay動的編集 + Genesis署名bootstrap採用 | 固定URLのままRelayを移行・冗長化 |
 
 **設計上の既知のトレードオフ**: JOIN の招待チェーンは Relay がスパム対策として検証するため、Relay はネットワークのメンバーグラフ（公開鍵・招待関係・ニックネーム）を観測できる。SDP・チャット・ファイルは見えない。メンバーグラフも隠す場合は Relay の検証を放棄する必要があり、本実装では検証を優先した。
 
 ## 検証
 
-- `npm test`: 52件 — 暗号（ECIES正逆・鍵違い・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/期限切れ復帰/失効抽出）、Relay統合（メンバーシップゲート/不正イベント耐性/SIGNAL宛先配布）
+- `npm test`: 61件 — 暗号（ECIES正逆・鍵違い・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/期限切れ復帰/著者別失効/squat防止/重複再ゴシップ抑止）、信頼スコア（加減点/遮断/順位/減衰）、Relay統合（メンバーシップゲート/不正イベント耐性/SIGNAL宛先配布）
 - `npm run test:e2e`: 実ブラウザ3ノード — 委譲チェーン参加、招待リンク、署名チャット双方向同期、参加前履歴の受信、CID検証ファイル転送、**Relay停止中のP2P継続**、Relay再起動後の再接続、**失効による連鎖排除**
+- 4ラウンドの敵対的監査（AIエージェントによる多次元レビュー＋反証検証）を実施し、各ラウンドの確認済み欠陥をすべて修正（クリティカル: Relayクラッシュ、失効un-revoke攻撃、NSゴシップ無限ストーム 等）
