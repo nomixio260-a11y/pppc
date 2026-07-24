@@ -10,8 +10,8 @@
  */
 
 const DB_NAME = "anp";
-const DB_VERSION = 1;
-const STORES = ["kv", "peers", "crdt", "ns", "blobs"] as const;
+const DB_VERSION = 2;
+const STORES = ["kv", "peers", "crdt", "ns", "blobs", "members"] as const;
 type StoreName = (typeof STORES)[number];
 
 export class AnpStore {

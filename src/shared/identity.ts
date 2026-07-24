@@ -28,8 +28,12 @@ import type {
   NetworkId,
   NodeId,
   PubKeyHex,
+  RevocationMap,
   Right,
 } from "./types.js";
+
+/** Hard cap on invite-chain length (verification CPU bound). */
+export const MAX_CHAIN_LENGTH = 16;
 
 export async function networkIdFromGenesisPubkey(genesisPubkeyHex: PubKeyHex): Promise<NetworkId> {
   return sha256Hex(hexToBytes(genesisPubkeyHex));
@@ -97,28 +101,45 @@ export async function verifyCertificate(cert: InviteCertificate, now = nowSecond
  *    genesis key, each intermediate link must carry the "invite" right, links
  *    must connect (issuer of link N+1 == subject of link N), and the final
  *    link must name `subjectPubkey` with the "join" right.
+ *  - If `revoked` is given, any link whose invite_id was revoked by its own
+ *    issuer or by the genesis key invalidates the whole chain (protocol v2).
+ *  - `ignoreExpiry` relaxes only the time checks (structure, signatures and
+ *    revocation still apply). Used to authenticate *historical* CRDT entries
+ *    from members whose certificates have since expired — without it, chat
+ *    history written by a lapsed member could never be verified by a new
+ *    node. It must never gate live connections or NS writes.
  */
 export async function verifyInviteChain(
   networkId: NetworkId,
   chain: InviteCertificate[],
   subjectPubkey: PubKeyHex,
   now = nowSeconds(),
+  revoked?: RevocationMap,
+  ignoreExpiry = false,
 ): Promise<{ ok: boolean; rights: Right[]; reason?: string }> {
   if ((await networkIdFromGenesisPubkey(subjectPubkey)) === networkId) {
     return { ok: true, rights: ["join", "invite", "chat", "store", "admin"] };
   }
   if (chain.length === 0) return { ok: false, rights: [], reason: "empty invite chain" };
+  if (chain.length > MAX_CHAIN_LENGTH) {
+    return { ok: false, rights: [], reason: "invite chain too long" };
+  }
 
   const first = chain[0]!;
   if ((await networkIdFromGenesisPubkey(first.issuer_pubkey)) !== networkId) {
     return { ok: false, rights: [], reason: "chain not rooted at genesis key" };
   }
+  const genesisPubkey = first.issuer_pubkey;
 
   for (let i = 0; i < chain.length; i++) {
     const cert = chain[i]!;
     if (cert.network_id !== networkId) return { ok: false, rights: [], reason: `link ${i}: wrong network` };
-    if (!(await verifyCertificate(cert, now))) {
+    const certNow = ignoreExpiry ? cert.issued_at + 1 : now;
+    if (!(await verifyCertificate(cert, certNow))) {
       return { ok: false, rights: [], reason: `link ${i}: invalid, revoked or expired` };
+    }
+    if (isCertRevoked(cert, genesisPubkey, revoked)) {
+      return { ok: false, rights: [], reason: `link ${i}: certificate revoked (${cert.invite_id})` };
     }
     if (i > 0) {
       const prev = chain[i - 1]!;
@@ -127,6 +148,10 @@ export async function verifyInviteChain(
       }
       if (!prev.rights.includes("invite")) {
         return { ok: false, rights: [], reason: `link ${i - 1}: issuer lacks invite right` };
+      }
+      // no privilege escalation: an issuer can only delegate rights it holds
+      if (!cert.rights.every((right) => prev.rights.includes(right))) {
+        return { ok: false, rights: [], reason: `link ${i}: rights exceed issuer's rights` };
       }
     }
   }
@@ -139,6 +164,20 @@ export async function verifyInviteChain(
     return { ok: false, rights: [], reason: "final link lacks join right" };
   }
   return { ok: true, rights: last.rights };
+}
+
+/**
+ * A revocation only counts when published by a key with authority over the
+ * certificate: its issuer, or the genesis key (network root of trust).
+ */
+export function isCertRevoked(
+  cert: InviteCertificate,
+  genesisPubkey: PubKeyHex,
+  revoked?: RevocationMap,
+): boolean {
+  const revokers = revoked?.get(cert.invite_id);
+  if (!revokers) return false;
+  return revokers.has(cert.issuer_pubkey) || revokers.has(genesisPubkey);
 }
 
 // ---------------------------------------------------------------------------

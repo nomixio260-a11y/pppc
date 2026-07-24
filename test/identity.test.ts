@@ -124,6 +124,56 @@ test("invite chain: rejected for wrong network / wrong subject / forged root", a
   assert.equal((await verifyInviteChain(networkId, [], node.publicKeyHex)).ok, false);
 });
 
+test("invite chain: delegated rights cannot exceed the issuer's rights", async () => {
+  const genesis = await generateKeyPair();
+  const alice = await generateKeyPair();
+  const bob = await generateKeyPair();
+  const networkId = await networkIdFromGenesisPubkey(genesis.publicKeyHex);
+
+  // alice holds join+invite+chat (no store, no admin)
+  const aliceCert = await issueCertificate({
+    networkId,
+    issuer: genesis,
+    subjectPubkey: alice.publicKeyHex,
+    rights: ["join", "invite", "chat"],
+  });
+  // ...but tries to grant bob store+admin
+  const escalated = await issueCertificate({
+    networkId,
+    issuer: alice,
+    subjectPubkey: bob.publicKeyHex,
+    rights: ["join", "chat", "store", "admin"],
+  });
+  const bad = await verifyInviteChain(networkId, [aliceCert, escalated], bob.publicKeyHex);
+  assert.equal(bad.ok, false);
+  assert.match(bad.reason ?? "", /rights exceed/);
+
+  // subset delegation is fine
+  const bounded = await issueCertificate({
+    networkId,
+    issuer: alice,
+    subjectPubkey: bob.publicKeyHex,
+    rights: ["join", "chat"],
+  });
+  assert.equal((await verifyInviteChain(networkId, [aliceCert, bounded], bob.publicKeyHex)).ok, true);
+});
+
+test("invite chain: absurdly long chains are rejected (CPU bound)", async () => {
+  const genesis = await generateKeyPair();
+  const node = await generateKeyPair();
+  const networkId = await networkIdFromGenesisPubkey(genesis.publicKeyHex);
+  const cert = await issueCertificate({
+    networkId,
+    issuer: genesis,
+    subjectPubkey: node.publicKeyHex,
+    rights: ["join", "invite"],
+  });
+  const chain = new Array(50).fill(cert);
+  const result = await verifyInviteChain(networkId, chain, node.publicKeyHex);
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /too long/);
+});
+
 test("genesis node itself joins without a chain", async () => {
   const genesis = await generateKeyPair();
   const networkId = await networkIdFromGenesisPubkey(genesis.publicKeyHex);

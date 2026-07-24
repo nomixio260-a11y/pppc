@@ -13,7 +13,10 @@
  */
 
 import { type KeyPairHandle, nowSeconds, signObject, verifyObject } from "./crypto.js";
-import type { NameRecord, NetworkId } from "./types.js";
+import type { NameRecord, NetworkId, RevocationMap, RevocationValue } from "./types.js";
+
+/** Name prefix for invite-certificate revocations (protocol v2). */
+export const REVOKED_PREFIX = "revoked/";
 
 export async function createNameRecord(
   networkId: NetworkId,
@@ -67,7 +70,9 @@ export class NameServiceStore {
     if (isExpired(record, now)) return false;
     if (!(await verifyNameRecord(record))) return false;
     const current = this.records.get(record.name);
-    if (!current || pickNewer(record, current) === record) {
+    // an expired stored record never beats a fresh incoming one — otherwise a
+    // name whose publisher restarted at version 1 could stay dead forever
+    if (!current || isExpired(current, now) || pickNewer(record, current) === record) {
       this.records.set(record.name, record);
       return true;
     }
@@ -96,5 +101,27 @@ export class NameServiceStore {
       const current = this.records.get(record.name);
       this.records.set(record.name, current ? pickNewer(record, current) : record);
     }
+  }
+
+  /**
+   * Extract the revocation map from `revoked/<invite_id>` records. The map
+   * only carries who *claimed* each revocation; authority (issuer or genesis)
+   * is judged at chain-verification time by `isCertRevoked`.
+   */
+  revocations(now = nowSeconds()): RevocationMap {
+    const map: RevocationMap = new Map();
+    for (const record of this.all(now)) {
+      if (!record.name.startsWith(REVOKED_PREFIX)) continue;
+      const value = record.value as RevocationValue;
+      if (value?.kind !== "revocation" || typeof value.invite_id !== "string") continue;
+      if (record.name !== `${REVOKED_PREFIX}${value.invite_id}`) continue;
+      let revokers = map.get(value.invite_id);
+      if (!revokers) {
+        revokers = new Set();
+        map.set(value.invite_id, revokers);
+      }
+      revokers.add(record.author_pubkey);
+    }
+    return map;
   }
 }

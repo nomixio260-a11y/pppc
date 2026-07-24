@@ -1,14 +1,32 @@
 /**
- * Relay client (design doc §6, §14.3).
+ * Relay client (design doc §6, §14.3), protocol v2.
  *
  * Connects to one or more relays over WebSocket, publishes signed events to
  * ALL of them, and subscribes on all of them, de-duplicating incoming events
  * by id. Using multiple relays means no single relay can partition or forge
  * the view (events are signed, so a relay can at worst hide them).
+ *
+ * v2 hardening:
+ *  - publish queue: events published while a socket is down are buffered
+ *    (until their expiry) and flushed on reconnect, so a relay flap can no
+ *    longer silently drop a JOIN or SIGNAL
+ *  - jittered exponential reconnect backoff (no thundering herd)
+ *  - per-relay statistics for the UI (§14.3: watch relays for divergence)
  */
 
 import { verifyEvent } from "../shared/events.js";
+import { nowSeconds } from "../shared/crypto.js";
 import type { AnpEvent, ClientFrame, EventFilter, RelayFrame } from "../shared/types.js";
+
+export interface RelayStats {
+  url: string;
+  connected: boolean;
+  eventsReceived: number;
+  eventsAccepted: number;
+  eventsRejected: number;
+  lastEventAt: number;
+  lastError?: string;
+}
 
 export interface RelayClientOptions {
   urls: string[];
@@ -17,45 +35,99 @@ export interface RelayClientOptions {
   onStatus?: (relayUrl: string, connected: boolean) => void;
 }
 
-const RECONNECT_MS = 3000;
+const BACKOFF_BASE_MS = 1_500;
+const BACKOFF_MAX_MS = 30_000;
+const MAX_QUEUED = 256;
+const MAX_SEEN_IDS = 10_000;
+
+interface RelayConn {
+  url: string;
+  ws?: WebSocket;
+  attempts: number;
+  /** events waiting for this relay to come back */
+  queue: AnpEvent[];
+  stats: RelayStats;
+  reconnectTimer?: ReturnType<typeof setTimeout>;
+}
 
 export class RelayPool {
-  private sockets = new Map<string, WebSocket>();
+  private conns = new Map<string, RelayConn>();
   private seen = new Set<string>();
   private closed = false;
 
   constructor(private readonly opts: RelayClientOptions) {}
 
   start(): void {
-    for (const url of this.opts.urls) this.connect(url);
+    for (const url of this.opts.urls) {
+      const conn: RelayConn = {
+        url,
+        attempts: 0,
+        queue: [],
+        stats: {
+          url,
+          connected: false,
+          eventsReceived: 0,
+          eventsAccepted: 0,
+          eventsRejected: 0,
+          lastEventAt: 0,
+        },
+      };
+      this.conns.set(url, conn);
+      this.connect(conn);
+    }
   }
 
   stop(): void {
     this.closed = true;
-    for (const ws of this.sockets.values()) ws.close();
-    this.sockets.clear();
+    for (const conn of this.conns.values()) {
+      if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
+      conn.ws?.close();
+    }
+    this.conns.clear();
   }
 
   connectedCount(): number {
     let n = 0;
-    for (const ws of this.sockets.values()) if (ws.readyState === WebSocket.OPEN) n++;
+    for (const conn of this.conns.values()) if (conn.stats.connected) n++;
     return n;
   }
 
-  private connect(url: string): void {
+  statsSnapshot(): RelayStats[] {
+    return [...this.conns.values()].map((c) => ({ ...c.stats }));
+  }
+
+  private scheduleReconnect(conn: RelayConn): void {
+    if (this.closed) return;
+    conn.attempts += 1;
+    const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (conn.attempts - 1));
+    const jitter = delay * (0.5 + Math.random() * 0.5);
+    conn.reconnectTimer = setTimeout(() => this.connect(conn), jitter);
+  }
+
+  private connect(conn: RelayConn): void {
     if (this.closed) return;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(url);
-    } catch {
-      setTimeout(() => this.connect(url), RECONNECT_MS);
+      ws = new WebSocket(conn.url);
+    } catch (err) {
+      conn.stats.lastError = (err as Error).message;
+      this.scheduleReconnect(conn);
       return;
     }
-    this.sockets.set(url, ws);
+    conn.ws = ws;
 
     ws.onopen = () => {
-      this.opts.onStatus?.(url, true);
+      conn.attempts = 0;
+      conn.stats.connected = true;
+      conn.stats.lastError = undefined;
+      this.opts.onStatus?.(conn.url, true);
       this.sendFrame(ws, { frame: "REQ", sub_id: "main", filter: this.opts.filter });
+      // flush events that were published while this relay was down
+      const now = nowSeconds();
+      const queued = conn.queue.splice(0);
+      for (const event of queued) {
+        if (event.expires_at > now) this.sendFrame(ws, { frame: "EVENT", event });
+      }
     };
     ws.onmessage = async (msg) => {
       let frame: RelayFrame;
@@ -64,34 +136,55 @@ export class RelayPool {
       } catch {
         return;
       }
+      if (frame.frame === "OK") {
+        if (frame.accepted) conn.stats.eventsAccepted++;
+        else {
+          conn.stats.eventsRejected++;
+          conn.stats.lastError = frame.message;
+        }
+        return;
+      }
       if (frame.frame === "EVENT") {
         const event = frame.event;
+        conn.stats.eventsReceived++;
+        conn.stats.lastEventAt = nowSeconds();
         if (this.seen.has(event.id)) return;
         // Never trust the relay: re-verify every event locally (§14.1).
-        const check = await verifyEvent(event);
+        // PoW is not re-checked here (powBits: 0) — invite chains gate
+        // membership; the relay-side PoW gate is anti-spam for storage.
+        const check = await verifyEvent(event, { powBits: 0 });
         if (!check.ok) return;
+        if (this.seen.has(event.id)) return; // re-check after await
         this.seen.add(event.id);
-        if (this.seen.size > 10_000) {
-          // bounded memory: drop the oldest half
+        if (this.seen.size > MAX_SEEN_IDS) {
           const ids = [...this.seen];
           this.seen = new Set(ids.slice(ids.length / 2));
         }
-        this.opts.onEvent(event, url);
+        this.opts.onEvent(event, conn.url);
       }
     };
     ws.onclose = () => {
-      this.opts.onStatus?.(url, false);
-      this.sockets.delete(url);
-      if (!this.closed) setTimeout(() => this.connect(url), RECONNECT_MS);
+      conn.stats.connected = false;
+      if (conn.ws === ws) conn.ws = undefined;
+      this.opts.onStatus?.(conn.url, false);
+      this.scheduleReconnect(conn);
     };
-    ws.onerror = () => ws.close();
+    ws.onerror = () => {
+      conn.stats.lastError = "socket error";
+      ws.close();
+    };
   }
 
-  /** Publish to every connected relay. */
+  /** Publish to every relay; queues for relays that are currently down. */
   publish(event: AnpEvent): void {
     this.seen.add(event.id); // don't re-process our own events
-    for (const ws of this.sockets.values()) {
-      if (ws.readyState === WebSocket.OPEN) this.sendFrame(ws, { frame: "EVENT", event });
+    for (const conn of this.conns.values()) {
+      if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+        this.sendFrame(conn.ws, { frame: "EVENT", event });
+      } else {
+        conn.queue.push(event);
+        if (conn.queue.length > MAX_QUEUED) conn.queue.shift();
+      }
     }
   }
 

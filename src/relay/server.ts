@@ -1,5 +1,5 @@
 /**
- * ANP Relay (design doc §7).
+ * ANP Relay (design doc §7), protocol v2.
  *
  * The relay is NOT the service. It only:
  *   - stores signed discovery/transport events, indexed by network_id
@@ -11,6 +11,13 @@
  * or act as an admin authority. State is in-memory only — losing it is fine,
  * because the network re-announces itself (design doc §13: regeneration, not
  * restoration).
+ *
+ * v2 hardening:
+ *   - per-connection token-bucket rate limiting (events and REQs)
+ *   - per-node event caps inside each network bucket
+ *   - WebSocket ping/pong liveness with dead-connection reaping
+ *   - subscription caps per connection
+ *   - JOIN proof-of-work enforcement (ANP_POW_BITS, default 12)
  *
  * Wire protocol (Nostr-like):
  *   client -> relay: {frame:"EVENT",event} | {frame:"REQ",sub_id,filter} | {frame:"CLOSE",sub_id}
@@ -24,14 +31,44 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
-import { verifyEvent } from "../shared/events.js";
+import { POW_BITS, verifyEvent } from "../shared/events.js";
 import { nowSeconds } from "../shared/crypto.js";
 import type { AnpEvent, ClientFrame, EventFilter, RelayFrame } from "../shared/types.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
+const POW_REQUIRED_BITS = Number(process.env.ANP_POW_BITS ?? POW_BITS);
 const PUBLIC_DIR = new URL("../../public", import.meta.url).pathname;
+
 const MAX_EVENTS_PER_NETWORK = 5000;
+/** cap for a node's stored discovery events (JOIN/HEARTBEAT/LEAVE/MANIFEST) */
+const MAX_EVENTS_PER_NODE = 16;
+/** separate, higher cap for SIGNAL bursts (trickle ICE during mesh bootstrap) */
+const MAX_SIGNALS_PER_NODE = 256;
+const MAX_NETWORKS = 1000;
+const MAX_CONNECTIONS = 500;
 const MAX_FRAME_BYTES = 256 * 1024;
+const MAX_SUBS_PER_CONN = 8;
+const RATE_CAPACITY = 60; // token bucket: burst
+const RATE_REFILL_PER_SEC = 6; // sustained events/sec per connection
+const PING_INTERVAL_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// Token bucket
+// ---------------------------------------------------------------------------
+
+class TokenBucket {
+  private tokens = RATE_CAPACITY;
+  private last = Date.now();
+
+  take(cost = 1): boolean {
+    const now = Date.now();
+    this.tokens = Math.min(RATE_CAPACITY, this.tokens + ((now - this.last) / 1000) * RATE_REFILL_PER_SEC);
+    this.last = now;
+    if (this.tokens < cost) return false;
+    this.tokens -= cost;
+    return true;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Event store
@@ -40,23 +77,80 @@ const MAX_FRAME_BYTES = 256 * 1024;
 class EventStore {
   /** network_id -> event_id -> event */
   private networks = new Map<string, Map<string, AnpEvent>>();
+  /** network_id -> node_id -> JOIN expiry: nodes that proved membership */
+  private joinIndex = new Map<string, Map<string, number>>();
+  /** network_id -> unix seconds of last accepted event (LRU eviction) */
+  private activity = new Map<string, number>();
 
-  add(event: AnpEvent): boolean {
+  /**
+   * Membership gate: a node may only store non-JOIN events after a valid
+   * (chain-verified, PoW-paying) JOIN — so throwaway keypairs cannot flood a
+   * network's bucket and evict legitimate discovery events.
+   */
+  hasLiveJoin(networkId: string, nodeId: string, now = nowSeconds()): boolean {
+    const expiry = this.joinIndex.get(networkId)?.get(nodeId);
+    return typeof expiry === "number" && expiry > now;
+  }
+
+  add(event: AnpEvent): { added: boolean; reason?: string } {
     let bucket = this.networks.get(event.network_id);
     if (!bucket) {
+      if (this.networks.size >= MAX_NETWORKS) this.evictColdestNetwork();
       bucket = new Map();
       this.networks.set(event.network_id, bucket);
     }
-    if (bucket.has(event.id)) return false;
-    if (bucket.size >= MAX_EVENTS_PER_NETWORK) this.evictOldest(bucket);
-    // A node's newer JOIN/HEARTBEAT/MANIFEST supersedes its older one.
-    if (event.type !== "SIGNAL") {
-      for (const [id, existing] of bucket) {
-        if (existing.node_id === event.node_id && existing.type === event.type) bucket.delete(id);
+    this.activity.set(event.network_id, nowSeconds());
+    if (event.type === "JOIN") {
+      let nodes = this.joinIndex.get(event.network_id);
+      if (!nodes) {
+        nodes = new Map();
+        this.joinIndex.set(event.network_id, nodes);
+      }
+      const prev = nodes.get(event.node_id) ?? 0;
+      nodes.set(event.node_id, Math.max(prev, event.expires_at));
+    }
+    if (bucket.has(event.id)) return { added: false, reason: "duplicate" };
+
+    // A node's newer JOIN/HEARTBEAT/MANIFEST/LEAVE supersedes its older one.
+    let discoveryCount = 0;
+    let signalCount = 0;
+    for (const [id, existing] of bucket) {
+      if (existing.node_id !== event.node_id) continue;
+      if (existing.type === "SIGNAL") signalCount++;
+      else discoveryCount++;
+      if (event.type !== "SIGNAL" && existing.type === event.type) {
+        bucket.delete(id);
+        discoveryCount--;
       }
     }
+    if (event.type === "SIGNAL" && signalCount >= MAX_SIGNALS_PER_NODE) {
+      return { added: false, reason: "per-node signal cap" };
+    }
+    if (event.type !== "SIGNAL" && discoveryCount >= MAX_EVENTS_PER_NODE) {
+      return { added: false, reason: "per-node event cap" };
+    }
+    if (bucket.size >= MAX_EVENTS_PER_NETWORK) this.evictOldest(bucket);
+
     bucket.set(event.id, event);
-    return true;
+    return { added: true };
+  }
+
+  /** At network capacity, drop the network idle the longest (not new joiners). */
+  private evictColdestNetwork(): void {
+    let coldest: string | undefined;
+    let coldestAt = Infinity;
+    for (const [networkId] of this.networks) {
+      const at = this.activity.get(networkId) ?? 0;
+      if (at < coldestAt) {
+        coldestAt = at;
+        coldest = networkId;
+      }
+    }
+    if (coldest) {
+      this.networks.delete(coldest);
+      this.joinIndex.delete(coldest);
+      this.activity.delete(coldest);
+    }
   }
 
   query(filter: EventFilter, now = nowSeconds()): AnpEvent[] {
@@ -79,6 +173,12 @@ class EventStore {
         }
       }
       if (bucket.size === 0) this.networks.delete(networkId);
+    }
+    for (const [networkId, nodes] of this.joinIndex) {
+      for (const [nodeId, expiry] of nodes) {
+        if (expiry <= now) nodes.delete(nodeId);
+      }
+      if (nodes.size === 0) this.joinIndex.delete(networkId);
     }
     return dropped;
   }
@@ -109,8 +209,7 @@ function matches(event: AnpEvent, filter: EventFilter, now: number): boolean {
   if (filter.node_id && event.node_id !== filter.node_id) return false;
   if (filter.since && event.created_at < filter.since) return false;
   if (event.type === "SIGNAL") {
-    // SIGNAL events are point-to-point: only deliver to their target
-    // (or to explicit node_id queries by the sender for debugging).
+    // SIGNAL events are point-to-point: only deliver to their target.
     if (!filter.target || event.body.target !== filter.target) return false;
   }
   return true;
@@ -132,15 +231,24 @@ interface Subscription {
 const subscriptions = new Set<Subscription>();
 
 async function ingest(event: AnpEvent): Promise<{ accepted: boolean; message?: string }> {
-  const check = await verifyEvent(event);
+  const check = await verifyEvent(event, { powBits: POW_REQUIRED_BITS });
   if (!check.ok) return { accepted: false, message: check.reason };
-  const fresh = store.add(event);
-  if (fresh) {
-    const now = nowSeconds();
-    for (const sub of subscriptions) {
-      if (sub.ws.readyState === WebSocket.OPEN && matches(event, sub.filter, now)) {
-        send(sub.ws, { frame: "EVENT", sub_id: sub.subId, event });
-      }
+  // membership gate: only nodes with a live chain-verified JOIN may store
+  // HEARTBEAT / LEAVE / MANIFEST / SIGNAL events (anti-flooding)
+  if (event.type !== "JOIN" && !store.hasLiveJoin(event.network_id, event.node_id)) {
+    return { accepted: false, message: "no live JOIN for this node (send JOIN first)" };
+  }
+  const result = store.add(event);
+  if (!result.added) {
+    // duplicates are fine (idempotent publish); caps are an error
+    return result.reason === "duplicate"
+      ? { accepted: true }
+      : { accepted: false, message: result.reason };
+  }
+  const now = nowSeconds();
+  for (const sub of subscriptions) {
+    if (sub.ws.readyState === WebSocket.OPEN && matches(event, sub.filter, now)) {
+      send(sub.ws, { frame: "EVENT", sub_id: sub.subId, event });
     }
   }
   return { accepted: true };
@@ -163,6 +271,7 @@ const MIME: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
 };
 
@@ -185,6 +294,20 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** REST rate limiting per remote address. */
+const restBuckets = new Map<string, TokenBucket>();
+setInterval(() => restBuckets.clear(), 10 * 60_000).unref();
+
+function restBucket(req: IncomingMessage): TokenBucket {
+  const key = req.socket.remoteAddress ?? "unknown";
+  let bucket = restBuckets.get(key);
+  if (!bucket) {
+    bucket = new TokenBucket();
+    restBuckets.set(key, bucket);
+  }
+  return bucket;
+}
+
 const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   try {
@@ -197,11 +320,13 @@ const httpServer = createServer(async (req, res) => {
       return res.end();
     }
     if (req.method === "POST" && url.pathname === "/event") {
+      if (!restBucket(req).take()) return json(res, 429, { accepted: false, message: "rate limited" });
       const event = JSON.parse(await readBody(req)) as AnpEvent;
       const result = await ingest(event);
       return json(res, result.accepted ? 200 : 400, result);
     }
     if (req.method === "GET" && url.pathname === "/events") {
+      if (!restBucket(req).take()) return json(res, 429, { error: "rate limited" });
       const networkId = url.searchParams.get("network_id");
       if (!networkId) return json(res, 400, { error: "network_id required" });
       const filter: EventFilter = { network_id: networkId };
@@ -214,13 +339,19 @@ const httpServer = createServer(async (req, res) => {
       return json(res, 200, { events: store.query(filter) });
     }
     if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, { ok: true, ...store.stats() });
+      return json(res, 200, {
+        ok: true,
+        pow_bits: POW_REQUIRED_BITS,
+        subscriptions: subscriptions.size,
+        ...store.stats(),
+      });
     }
     // static client
     if (req.method === "GET") {
       const rel = url.pathname === "/" ? "/index.html" : url.pathname;
       const path = normalize(join(PUBLIC_DIR, rel));
-      if (!path.startsWith(normalize(PUBLIC_DIR))) {
+      const root = normalize(PUBLIC_DIR);
+      if (path !== root && !path.startsWith(root + "/")) {
         res.writeHead(403);
         return res.end("forbidden");
       }
@@ -246,13 +377,41 @@ const httpServer = createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_FRAME_BYTES });
 
-wss.on("connection", (ws) => {
-  const mySubs = new Set<Subscription>();
+interface ConnState {
+  alive: boolean;
+  bucket: TokenBucket;
+  subs: Set<Subscription>;
+}
 
-  ws.on("message", async (raw) => {
+const connections = new Map<WebSocket, ConnState>();
+
+wss.on("connection", (ws) => {
+  if (connections.size >= MAX_CONNECTIONS) {
+    ws.close(1013, "server busy");
+    return;
+  }
+  const state: ConnState = { alive: true, bucket: new TokenBucket(), subs: new Set() };
+  connections.set(ws, state);
+
+  ws.on("pong", () => {
+    state.alive = true;
+  });
+
+  // wrap the async handler so a crafted frame can never produce an
+  // unhandled rejection that takes down the whole relay process
+  ws.on("message", (raw) => {
+    void handleFrame(raw.toString()).catch((err) => {
+      send(ws, { frame: "NOTICE", message: `internal error: ${(err as Error).message}` });
+    });
+  });
+
+  async function handleFrame(text: string): Promise<void> {
+    if (!state.bucket.take()) {
+      return send(ws, { frame: "NOTICE", message: "rate limited" });
+    }
     let frame: ClientFrame;
     try {
-      frame = JSON.parse(raw.toString()) as ClientFrame;
+      frame = JSON.parse(text) as ClientFrame;
     } catch {
       return send(ws, { frame: "NOTICE", message: "invalid json" });
     }
@@ -260,7 +419,7 @@ wss.on("connection", (ws) => {
       const result = await ingest(frame.event);
       send(ws, {
         frame: "OK",
-        event_id: frame.event?.id ?? "",
+        event_id: typeof frame.event?.id === "string" ? frame.event.id : "",
         accepted: result.accepted,
         message: result.message,
       });
@@ -269,38 +428,60 @@ wss.on("connection", (ws) => {
         return send(ws, { frame: "NOTICE", message: "REQ requires sub_id and filter.network_id" });
       }
       // replace an existing subscription with the same id
-      for (const sub of mySubs) {
+      for (const sub of state.subs) {
         if (sub.subId === frame.sub_id) {
-          mySubs.delete(sub);
+          state.subs.delete(sub);
           subscriptions.delete(sub);
         }
       }
+      if (state.subs.size >= MAX_SUBS_PER_CONN) {
+        return send(ws, { frame: "NOTICE", message: "too many subscriptions" });
+      }
       const sub: Subscription = { ws, subId: frame.sub_id, filter: frame.filter };
-      mySubs.add(sub);
+      state.subs.add(sub);
       subscriptions.add(sub);
       for (const event of store.query(frame.filter)) {
         send(ws, { frame: "EVENT", sub_id: frame.sub_id, event });
       }
       send(ws, { frame: "EOSE", sub_id: frame.sub_id });
     } else if (frame.frame === "CLOSE") {
-      for (const sub of mySubs) {
+      for (const sub of state.subs) {
         if (sub.subId === frame.sub_id) {
-          mySubs.delete(sub);
+          state.subs.delete(sub);
           subscriptions.delete(sub);
         }
       }
     } else {
       send(ws, { frame: "NOTICE", message: "unknown frame" });
     }
-  });
+  }
 
   ws.on("close", () => {
-    for (const sub of mySubs) subscriptions.delete(sub);
+    for (const sub of state.subs) subscriptions.delete(sub);
+    connections.delete(ws);
   });
+  ws.on("error", () => ws.close());
 });
+
+// liveness: ping every connection; reap ones that never pong back
+setInterval(() => {
+  for (const [ws, state] of connections) {
+    if (!state.alive) {
+      ws.terminate();
+      continue;
+    }
+    state.alive = false;
+    try {
+      ws.ping();
+    } catch {
+      ws.terminate();
+    }
+  }
+}, PING_INTERVAL_MS).unref();
 
 httpServer.listen(PORT, () => {
   console.log(`[anp-relay] listening on http://localhost:${PORT}`);
   console.log(`[anp-relay] ws endpoint  ws://localhost:${PORT}`);
   console.log(`[anp-relay] client UI    http://localhost:${PORT}/`);
+  console.log(`[anp-relay] join PoW     ${POW_REQUIRED_BITS} bits`);
 });

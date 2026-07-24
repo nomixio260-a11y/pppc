@@ -192,3 +192,104 @@ export function randomHex(bytes: number): string {
   globalThis.crypto.getRandomValues(buf);
   return bytesToHex(buf);
 }
+
+// ---------------------------------------------------------------------------
+// ECIES (ECDH-ES + HKDF + AES-256-GCM)
+//
+// Used to encrypt SIGNAL payloads end-to-end between nodes, so relays never
+// see SDP contents (which include local/public IP addresses). The same P-256
+// key pair used for ECDSA signatures is re-imported for ECDH key agreement.
+// ---------------------------------------------------------------------------
+
+export interface EciesEnvelope {
+  /** ephemeral sender public key, raw hex */
+  epk: string;
+  /** AES-GCM IV, hex */
+  iv: string;
+  /** ciphertext, base64url */
+  ct: string;
+}
+
+const ECDH_PARAMS: EcKeyGenParams = { name: "ECDH", namedCurve: "P-256" };
+const HKDF_INFO = utf8Encode("anp-signal-v2");
+
+async function deriveAesKey(
+  privateKey: CryptoKey,
+  publicKey: CryptoKey,
+  saltHex: string,
+): Promise<CryptoKey> {
+  const shared = await subtle.deriveBits({ name: "ECDH", public: publicKey }, privateKey, 256);
+  const hkdfKey = await subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
+  return subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: hexToBytes(saltHex) as BufferSource, info: HKDF_INFO as BufferSource },
+    hkdfKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+export async function importPublicKeyForEcdh(publicKeyHex: string): Promise<CryptoKey> {
+  return subtle.importKey("raw", hexToBytes(publicKeyHex) as BufferSource, ECDH_PARAMS, false, []);
+}
+
+/** Re-import an ECDSA private JWK for ECDH key agreement. */
+export async function importPrivateKeyForEcdh(privateJwk: JsonWebKey): Promise<CryptoKey> {
+  const jwk: JsonWebKey = { ...privateJwk, key_ops: ["deriveBits"] };
+  delete (jwk as Record<string, unknown>)["alg"];
+  return subtle.importKey("jwk", jwk, ECDH_PARAMS, false, ["deriveBits"]);
+}
+
+export async function eciesEncrypt(recipientPubkeyHex: string, plaintext: Uint8Array): Promise<EciesEnvelope> {
+  const eph = (await subtle.generateKey(ECDH_PARAMS, true, ["deriveBits"])) as CryptoKeyPair;
+  const epkHex = bytesToHex(new Uint8Array(await subtle.exportKey("raw", eph.publicKey)));
+  const recipient = await importPublicKeyForEcdh(recipientPubkeyHex);
+  const aesKey = await deriveAesKey(eph.privateKey, recipient, epkHex + recipientPubkeyHex);
+  const iv = new Uint8Array(12);
+  globalThis.crypto.getRandomValues(iv);
+  const ct = await subtle.encrypt({ name: "AES-GCM", iv: iv as BufferSource }, aesKey, plaintext as BufferSource);
+  return { epk: epkHex, iv: bytesToHex(iv), ct: base64UrlEncode(new Uint8Array(ct)) };
+}
+
+export async function eciesDecrypt(
+  recipientPrivateEcdh: CryptoKey,
+  recipientPubkeyHex: string,
+  envelope: EciesEnvelope,
+): Promise<Uint8Array> {
+  const epk = await importPublicKeyForEcdh(envelope.epk);
+  const aesKey = await deriveAesKey(recipientPrivateEcdh, epk, envelope.epk + recipientPubkeyHex);
+  const pt = await subtle.decrypt(
+    { name: "AES-GCM", iv: hexToBytes(envelope.iv) as BufferSource },
+    aesKey,
+    base64UrlDecode(envelope.ct) as BufferSource,
+  );
+  return new Uint8Array(pt);
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight proof-of-work (design doc §14.4, Sybil resistance)
+//
+// A JOIN event must have an id (sha256 of its canonical form) with at least
+// `bits` leading zero bits; the sender grinds `body.pow_nonce` until it does.
+// At the default 12 bits this is ~4096 hashes (milliseconds), yet it makes
+// bulk identity minting measurably expensive.
+// ---------------------------------------------------------------------------
+
+export function leadingZeroBits(hex: string): number {
+  let bits = 0;
+  for (const ch of hex) {
+    const nibble = Number.parseInt(ch, 16);
+    if (Number.isNaN(nibble)) return bits;
+    if (nibble === 0) {
+      bits += 4;
+      continue;
+    }
+    bits += Math.clz32(nibble) - 28;
+    break;
+  }
+  return bits;
+}
+
+export function hasPow(idHex: string, bits: number): boolean {
+  return leadingZeroBits(idHex) >= bits;
+}

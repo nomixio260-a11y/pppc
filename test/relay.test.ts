@@ -137,11 +137,11 @@ test("websocket REQ returns stored events, EOSE, then live pushes", async () => 
 test("SIGNAL events are only delivered to their target", async () => {
   const { node, networkId, chain } = await makeMember();
   await postEvent(await createJoin(networkId, node, chain));
+  const target = await generateKeyPair();
   const targetId = "ab".repeat(32);
-  const signal = await createSignal(networkId, node, {
-    target: targetId,
-    session: "s1",
-    payload: { kind: "offer", sdp: "v=0" },
+  const signal = await createSignal(networkId, node, targetId, target.publicKeyHex, "s1", 0, {
+    kind: "offer",
+    sdp: "v=0",
   });
   await postEvent(signal);
 
@@ -157,6 +157,37 @@ test("SIGNAL events are only delivered to their target", async () => {
   const { events } = (await rightTarget.json()) as { events: AnpEvent[] };
   assert.equal(events.length, 1);
   assert.equal(events[0]!.id, signal.id);
+});
+
+test("membership gate: HEARTBEAT without a prior JOIN is rejected", async () => {
+  const { node, networkId } = await makeMember();
+  const hb = await createHeartbeat(networkId, node);
+  const posted = await postEvent(hb);
+  assert.equal(posted.body.accepted, false);
+  assert.match((posted.body as { message?: string }).message ?? "", /no live JOIN/);
+});
+
+test("malformed events cannot crash the relay (REST and WS)", async () => {
+  // REST: garbage pubkey that would throw inside hex decoding
+  const { node, networkId, chain } = await makeMember();
+  const join = await createJoin(networkId, node, chain);
+  const evil = { ...join, pubkey: "zznot-hex", node_id: "zz" } as AnpEvent;
+  const posted = await postEvent(evil);
+  assert.equal(posted.body.accepted, false);
+
+  // WS: EVENT frame with a non-object event
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
+  await new Promise<void>((resolve) => (ws.onopen = () => resolve()));
+  ws.send(JSON.stringify({ frame: "EVENT", event: null }));
+  ws.send(JSON.stringify({ frame: "EVENT", event: { id: 42, body: { toString: "x" } } }));
+  ws.send("garbage not json");
+  await new Promise((r) => setTimeout(r, 300));
+  ws.close();
+
+  // relay must still be alive and serving
+  const health = await fetch(`${BASE}/health`);
+  assert.equal(health.status, 200);
+  assert.equal(((await health.json()) as { ok: boolean }).ok, true);
 });
 
 test("node_id matches sha256 of pubkey in served events", async () => {

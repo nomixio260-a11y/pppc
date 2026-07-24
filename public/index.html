@@ -8,9 +8,11 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <div id="toasts"></div>
+
   <header>
-    <h1>ANP <span class="sub">Autonomous Network Protocol</span></h1>
-    <p class="tagline">ブラウザ完結型・招待制・分散ホストネットワーク</p>
+    <h1>ANP <span class="sub">Autonomous Network Protocol v2</span></h1>
+    <p class="tagline">ブラウザ完結型・招待制・分散ホストネットワーク — E2E暗号シグナリング / 署名付きCRDT / 失効対応</p>
   </header>
 
   <!-- ======================= Setup ======================= -->
@@ -25,20 +27,27 @@
       <button id="btn-create" class="primary">ネットワークを作成して参加</button>
     </div>
 
-    <div class="card">
+    <div class="card" id="join-card">
       <h2>招待を受けて参加</h2>
       <ol class="muted small">
         <li>「参加リクエストコードを作成」を押し、表示されたコードを招待者に渡す</li>
-        <li>招待者から受け取った招待バンドルを貼り付けて参加する</li>
+        <li>招待者から受け取った招待バンドル(または招待リンク)で参加する</li>
       </ol>
       <button id="btn-request">1. 参加リクエストコードを作成</button>
       <textarea id="request-code" rows="3" readonly hidden></textarea>
       <p id="request-hint" class="muted small" hidden>↑ このコード(あなたの公開鍵)を招待者に送ってください。秘密鍵はこのブラウザから出ません。</p>
       <label>ニックネーム <input id="join-nickname" placeholder="member" /></label>
       <label>招待バンドル
-        <textarea id="join-bundle" rows="4" placeholder="招待者から受け取った文字列を貼り付け"></textarea>
+        <textarea id="join-bundle" rows="4" placeholder="招待者から受け取った文字列を貼り付け (招待リンクを開くと自動入力されます)"></textarea>
       </label>
       <button id="btn-join" class="primary">2. 検証して参加</button>
+    </div>
+
+    <div class="card">
+      <h2>identity をインポート</h2>
+      <p class="muted small">別ブラウザでエクスポートした identity JSON で同じノードとして復帰します。</p>
+      <textarea id="import-json" rows="3" placeholder='{"v":1,...}'></textarea>
+      <button id="btn-import">インポート</button>
     </div>
   </section>
 
@@ -54,9 +63,10 @@
         <div><span>役割</span><span id="net-role"></span></div>
         <div><span>権限</span><span id="net-rights"></span></div>
       </div>
-      <h3>Relay</h3>
+      <h3>Relay (複数接続・単一依存回避)</h3>
       <ul id="relay-list" class="plain"></ul>
-      <div class="row">
+      <div class="row wrap-row">
+        <button id="btn-export">identity をエクスポート</button>
         <button id="btn-leave">LEAVE を送信して切断</button>
         <button id="btn-reset" class="danger">identity を完全削除</button>
       </div>
@@ -64,11 +74,17 @@
 
     <div class="card" id="invite-card" hidden>
       <h2>招待を発行</h2>
-      <p class="muted small">相手の参加リクエストコード(公開鍵)を貼り付けると、署名済み招待バンドルを発行します。</p>
+      <p class="muted small">相手の参加リクエストコード(公開鍵)を貼り付けると、署名済み招待バンドルと招待リンクを発行します。</p>
       <label>参加リクエストコード <input id="invite-pubkey" placeholder="04..." /></label>
       <label class="inline"><input type="checkbox" id="invite-grant" /> 招待権も付与する</label>
       <button id="btn-issue" class="primary">招待バンドルを発行</button>
-      <textarea id="invite-bundle" rows="4" readonly hidden></textarea>
+      <textarea id="invite-bundle" rows="3" readonly hidden></textarea>
+      <div class="row" id="invite-link-row" hidden>
+        <input id="invite-link" readonly />
+        <button id="btn-copy-invite-link" class="mini">リンクをコピー</button>
+      </div>
+      <h3>発行済み招待 (失効 = 該当ノードの排除)</h3>
+      <ul id="issued-list" class="plain"></ul>
     </div>
 
     <div class="card">
@@ -77,12 +93,14 @@
     </div>
 
     <div class="card">
-      <h2>service/chat <span class="badge">CRDT</span></h2>
+      <h2>service/chat + service/files <span class="badge">署名付きCRDT / CID検証転送</span></h2>
       <div id="chat-box"></div>
       <div class="row">
         <input id="chat-input" placeholder="メッセージ (WebRTC DataChannel で直接送信)" />
+        <button id="btn-file" title="ファイルを共有">📄</button>
         <button id="btn-send" class="primary">送信</button>
       </div>
+      <input type="file" id="file-input" hidden />
     </div>
 
     <div class="card">
@@ -105,7 +123,7 @@
   </section>
 
   <footer class="muted small">
-    固定URL → Network ID → 招待証明書 → Relayで発見 → WebRTCで直接接続 → P2Pメッシュ → Name Service
+    固定URL → Network ID → 招待証明書 → Relayで発見 → E2E暗号シグナリング → WebRTCメッシュ → 署名付きCRDT/NS → 1つの仮想サーバー
   </footer>
 
   <script type="module" src="/anp.js"></script>

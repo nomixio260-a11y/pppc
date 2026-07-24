@@ -31,12 +31,23 @@ test("GSetLog: merge is idempotent and reports only new entries", () => {
   assert.equal(b.merge([e]).length, 0);
 });
 
-test("GSetLog: delta since lamport", () => {
+test("GSetLog: version-vector delta covers unseen origins", () => {
   const a = new GSetLog("aaaa");
-  a.append("chat", { text: "1" }, 1);
-  const second = a.append("chat", { text: "2" }, 2);
-  const delta = a.entriesSince(1);
-  assert.deepEqual(delta.map((e) => e.id), [second.id]);
+  const b = new GSetLog("bbbb");
+  const c = new GSetLog("cccc");
+  // c writes early (low lamport), a writes later (high lamport); b merges only a
+  const c1 = c.append("chat", { text: "from c" }, 1);
+  a.append("chat", { text: "a1" }, 2);
+  a.append("chat", { text: "a2" }, 3);
+  a.merge([c1]);
+  b.merge(a.entriesMissingFrom(b.versionVector()));
+  // b must have received c's entry even though its lamport is lower than a's max —
+  // a lamport-watermark sync would have skipped it
+  assert.equal(b.size(), 3);
+  assert.ok(b.ordered().some((e) => e.origin === "cccc"));
+
+  // and a delta against b's now-complete vector is empty
+  assert.equal(a.entriesMissingFrom(b.versionVector()).length, 0);
 });
 
 test("GSetLog: rehydration continues seq without id collisions", () => {

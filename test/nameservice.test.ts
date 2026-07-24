@@ -70,6 +70,26 @@ test("ttl expiry", async () => {
   assert.equal(store.resolve("n", record.updated_at + 11), undefined);
 });
 
+test("an expired stored record never beats a fresh incoming one", async () => {
+  const { keys, networkId } = await setup();
+  const { signObject } = await import("../src/shared/crypto.js");
+  const store = new NameServiceStore(networkId);
+
+  // a validly-signed but already-expired v5 record, injected via load()
+  const expired = await createNameRecord(networkId, keys, "n", "old", 5, 10);
+  (expired as { updated_at: number }).updated_at -= 100;
+  expired.signature = "";
+  expired.signature = await signObject(keys.privateKey, expired as unknown as Record<string, unknown>, [
+    "signature",
+  ]);
+  store.load([expired]);
+
+  // a publisher that lost its state restarts at version 1 — it must win
+  const fresh = await createNameRecord(networkId, keys, "n", "new", 1, 600);
+  assert.equal(await store.merge(fresh), true, "fresh v1 must replace expired v5");
+  assert.equal(store.resolve("n")?.value, "new");
+});
+
 test("replicas converge regardless of merge order", async () => {
   const { keys, networkId } = await setup();
   const a = new NameServiceStore(networkId);

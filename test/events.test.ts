@@ -67,22 +67,23 @@ test("expired events are rejected", async () => {
   const { node, networkId, chain } = await makeMember();
   const join = await createJoin(networkId, node, chain);
   const future = join.expires_at + 1;
-  assert.equal((await verifyEvent(join, future)).ok, false);
+  assert.equal((await verifyEvent(join, { now: future })).ok, false);
 });
 
 test("HEARTBEAT / LEAVE / MANIFEST / SIGNAL verify", async () => {
   const { node, networkId } = await makeMember();
+  const other = await generateKeyPair();
   assert.equal((await verifyEvent(await createHeartbeat(networkId, node))).ok, true);
   assert.equal((await verifyEvent(await createLeave(networkId, node))).ok, true);
   assert.equal(
     (await verifyEvent(await createManifest(networkId, node, { relays: [], records: [] }))).ok,
     true,
   );
-  const signal = (await createSignal(networkId, node, {
-    target: "f".repeat(64),
-    session: "s1",
-    payload: { kind: "offer", sdp: "v=0..." },
+  const signal = (await createSignal(networkId, node, "f".repeat(64), other.publicKeyHex, "s1", 0, {
+    kind: "offer",
+    sdp: "v=0...",
   })) as SignalEvent;
   assert.equal((await verifyEvent(signal)).ok, true);
   assert.equal(signal.body.target, "f".repeat(64));
+  assert.equal(typeof signal.body.enc.ct, "string");
 });
