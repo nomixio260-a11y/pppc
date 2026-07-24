@@ -57,6 +57,31 @@ export function normalizeRoom(room: string): string {
   return room.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 64);
 }
 
+/**
+ * Direct message: a private open network shared by exactly two identities.
+ * The room string is `dm:<pkA>:<pkB>` with the pubkeys sorted, so both parties
+ * derive the same network id, and no third party may join (enforced in
+ * verifyEvent). Message bodies are additionally encrypted with an ECDH shared
+ * key, so the relay sees neither the content nor (without the room) the pair.
+ */
+export function dmRoom(pubkeyA: PubKeyHex, pubkeyB: PubKeyHex): string {
+  const [a, b] = [pubkeyA, pubkeyB].sort();
+  return `dm:${a}:${b}`;
+}
+
+export function dmPubkeys(room: string): [PubKeyHex, PubKeyHex] | null {
+  const m = /^dm:([0-9a-f]{130}):([0-9a-f]{130})$/.exec(room);
+  return m ? [m[1]!, m[2]!] : null;
+}
+
+export function isDmRoom(room: string | undefined): boolean {
+  return typeof room === "string" && room.startsWith("dm:");
+}
+
+export async function dmNetworkId(pubkeyA: PubKeyHex, pubkeyB: PubKeyHex): Promise<NetworkId> {
+  return openNetworkId(dmRoom(pubkeyA, pubkeyB));
+}
+
 export async function networkIdFromGenesisPubkey(genesisPubkeyHex: PubKeyHex): Promise<NetworkId> {
   return sha256Hex(hexToBytes(genesisPubkeyHex));
 }

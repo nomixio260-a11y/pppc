@@ -1,21 +1,13 @@
 /**
- * ANP browser node — application wiring (protocol v2).
+ * ANP Chat — orchestrator.
  *
- * Boot flow (design doc §8):
- *   creator:  genesis keys -> network id -> self-invite cert -> JOIN
- *   invitee:  node keys -> join request code -> invite bundle -> verify -> JOIN
+ * One identity, many conversations. Each conversation (channel or DM) is an
+ * independent ANP network handled by a `Conversation` (relay + WebRTC mesh +
+ * chat CRDT). This module owns the identity, the shared relay list, the list
+ * of open conversations, and the UI (a conversation sidebar + active chat).
  *
- * After JOIN the node subscribes on the relay pool, forms a WebRTC mesh with
- * every live peer, and synchronizes the chat CRDT, profile CRDT, the Name
- * Service record set and content-addressed files over DataChannels.
- *
- * v2 additions:
- *  - membership registry: only entries/cells signed by verified members are
- *    merged; unknown origins are resolved with MEMBER_REQ/MEMBER_PROOF
- *  - invite revocation, replicated as name-service records and enforced
- *    against live peers
- *  - invite links (#invite=...), identity export/import, sendBeacon LEAVE,
- *    version-vector chat sync, per-relay health display
+ * Default experience: pick a display name, land in #general, and browse or
+ * create channels / start DMs from the sidebar — no room-name wall.
  */
 
 import {
@@ -25,83 +17,37 @@ import {
   generateKeyPair,
   importKeyPair,
   importPrivateKeyForEcdh,
-  nowSeconds,
-  randomHex,
 } from "../shared/crypto.js";
 import {
-  anpUrl,
-  decodeInviteBundle,
-  encodeInviteBundle,
-  issueCertificate,
-  networkIdFromGenesisPubkey,
+  dmNetworkId,
+  dmRoom,
   nodeIdFromPubkey,
   normalizeRoom,
   openNetworkId,
-  verifyInviteChain,
 } from "../shared/identity.js";
-import {
-  HEARTBEAT_INTERVAL,
-  HEARTBEAT_TTL,
-  JOIN_TTL,
-  createHeartbeat,
-  createJoin,
-  createLeave,
-  createManifest,
-} from "../shared/events.js";
-import {
-  GSetLog,
-  LwwMap,
-  replicaNodeId,
-  signCell,
-  signLogEntry,
-  verifyCell,
-  verifyLogEntry,
-  type LogEntry,
-  type LwwCell,
-} from "../shared/crdt.js";
-import {
-  NameServiceStore,
-  REVOKED_PREFIX,
-  createNameRecord,
-  isValidRevocationRecord,
-  revocationName,
-} from "../shared/nameservice.js";
-import type {
-  AnpEvent,
-  FileMeta,
-  InviteBundle,
-  InviteCertificate,
-  JoinEvent,
-  MemberRecord,
-  NameRecord,
-  NodeId,
-  RevocationMap,
-  Right,
-} from "../shared/types.js";
 import { AnpStore } from "./store.js";
-import { RelayPool } from "./relayclient.js";
-import { Mesh, type DcMessage } from "./webrtc.js";
-import { FileService } from "./files.js";
-import { BAN_THRESHOLD, Reputation, type PeerScore } from "../shared/reputation.js";
+import { Reputation, type PeerScore } from "../shared/reputation.js";
+import { Conversation, type ConvSpec, type Identity } from "./conversation.js";
+import type { FileMeta } from "../shared/types.js";
 
-interface NodeConfig {
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+let store: AnpStore;
+let reputation = new Reputation();
+let identity: Identity | undefined;
+let nickname = "";
+let relays: string[] = [];
+const conversations = new Map<string, Conversation>();
+let activeId: string | undefined;
+
+interface ConvPersist {
   network_id: string;
-  relays: string[];
-  nickname: string;
-  is_genesis: boolean;
-  /** open room (default discovery mode): invite-less, auto-join */
-  open: boolean;
-  /** room name (only for open networks) */
-  room?: string;
-}
-
-interface IssuedInvite {
-  invite_id: string;
-  subject_pubkey: string;
-  rights: Right[];
-  issued_at: number;
-  issued_by: "genesis" | "node";
-  revoked?: boolean;
+  kind: "channel" | "dm";
+  room: string;
+  title: string;
+  peerPubkey?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,36 +56,25 @@ interface IssuedInvite {
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
-  if (!el) throw new Error(`missing element #${id}`);
+  if (!el) throw new Error(`missing #${id}`);
   return el as T;
 };
-
-function short(id: string): string {
-  return id ? `${id.slice(0, 12)}…` : "";
+const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const short = (id: string) => (id ? `${id.slice(0, 10)}…` : "");
+function humanSize(b: number): string {
+  if (b < 1024) return `${b}B`;
+  if (b < 1048576) return `${(b / 1024).toFixed(1)}KB`;
+  return `${(b / 1048576).toFixed(1)}MB`;
 }
-
-function escapeHtml(text: string): string {
-  return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const AVATAR_COLORS = ["#6d5efc", "#e0567a", "#20a4a4", "#e0952b", "#3b82f6", "#8b5cf6", "#16a34a", "#db2777"];
+function avatarColor(id: string): string {
+  let h = 0;
+  for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length]!;
 }
-
-function humanSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
-}
-
-function defaultRelays(): string[] {
-  if (location.protocol.startsWith("http")) {
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    return [`${proto}//${location.host}`];
-  }
-  // opened straight from a file:// — no server in sight; default to offline
-  // (relay-less). Users can still add a relay by hand, or use offline connect.
-  return [];
-}
-
-function relayHttpUrl(wsUrl: string): string {
-  return wsUrl.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
+const initial = (name: string) => (name.trim()[0] ?? "?").toUpperCase();
+function avatarHtml(id: string, name: string, cls = "avatar"): string {
+  return `<span class="${cls}" style="background:${avatarColor(id)}">${escapeHtml(initial(name))}</span>`;
 }
 
 function toast(message: string, kind: "info" | "ok" | "error" = "info"): void {
@@ -154,1600 +89,11 @@ function toast(message: string, kind: "info" | "ok" | "error" = "info"): void {
     setTimeout(() => el.remove(), 400);
   }, 4000);
 }
-
 function log(line: string): void {
-  const el = $("log");
-  const time = new Date().toLocaleTimeString();
-  el.textContent = `[${time}] ${line}\n${el.textContent ?? ""}`.slice(0, 20_000);
+  const el = document.getElementById("log");
+  if (!el) return;
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${line}\n${el.textContent ?? ""}`.slice(0, 12000);
 }
-
-// ---------------------------------------------------------------------------
-// App state
-// ---------------------------------------------------------------------------
-
-let store: AnpStore;
-let config: NodeConfig | undefined;
-let nodeKeys: KeyPairHandle | undefined;
-let nodeStoredKeys: StoredKeyPair | undefined;
-let genesisKeys: KeyPairHandle | undefined;
-let inviteChain: InviteCertificate[] = [];
-let issuedInvites: IssuedInvite[] = [];
-let myRights: Right[] = [];
-let myNodeId = "";
-
-let pool: RelayPool | undefined;
-let mesh: Mesh | undefined;
-let files: FileService | undefined;
-let reputation = new Reputation();
-let chatLog: GSetLog | undefined;
-let profileMap: LwwMap | undefined;
-let nameService: NameServiceStore | undefined;
-let revocations: RevocationMap = new Map();
-let latestLeave: AnpEvent | undefined;
-let cachedJoin: AnpEvent | undefined;
-let timers: number[] = [];
-
-/** verified members: node_id -> record (from JOIN events and MEMBER_PROOFs) */
-const members = new Map<NodeId, MemberRecord>();
-/** chat entries whose origin membership is not yet proven (keyed by node id) */
-const pendingEntries = new Map<NodeId, { entries: LogEntry[]; since: number }>();
-let pendingEntryTotal = 0;
-const MAX_PENDING = 500;
-const MAX_PENDING_ORIGINS = 64;
-const MAX_ENTRIES_PER_DELTA = 512;
-/** origins we've already asked a proof for recently */
-const proofRequested = new Map<NodeId, number>();
-const MAX_PROOF_REQUESTED = 256;
-/** interval for periodic anti-entropy with a random connected peer */
-const ANTI_ENTROPY_MS = 60_000;
-
-/** Evict the pending-origin bucket that has waited longest (bounded memory). */
-function evictOldestPending(): void {
-  let oldest: NodeId | undefined;
-  let oldestAt = Infinity;
-  for (const [nodeId, p] of pendingEntries) {
-    if (p.since < oldestAt) {
-      oldestAt = p.since;
-      oldest = nodeId;
-    }
-  }
-  if (oldest) {
-    pendingEntryTotal -= pendingEntries.get(oldest)!.entries.length;
-    pendingEntries.delete(oldest);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Persistence
-// ---------------------------------------------------------------------------
-
-async function persistChat(): Promise<void> {
-  if (chatLog) await store.put("crdt", "chat", chatLog.toJSON());
-}
-async function persistProfile(): Promise<void> {
-  if (profileMap) await store.put("crdt", "profile", profileMap.toJSON());
-}
-async function persistNs(): Promise<void> {
-  if (!nameService) return;
-  for (const record of nameService.all()) await store.put("ns", record.name, record);
-}
-async function persistIssued(): Promise<void> {
-  await store.put("kv", "issuedInvites", issuedInvites);
-}
-
-// ---------------------------------------------------------------------------
-// Membership registry
-// ---------------------------------------------------------------------------
-
-async function registerMember(
-  nodeId: NodeId,
-  pubkey: string,
-  chain: InviteCertificate[],
-  nickname: string | undefined,
-  rights: Right[],
-  historical = false,
-): Promise<boolean> {
-  const existing = members.get(nodeId);
-  if (existing && existing.pubkey !== pubkey) return false; // key substitution attempt
-  if (existing && !existing.historical && historical) return false; // never downgrade
-  const record: MemberRecord = {
-    node_id: nodeId,
-    pubkey,
-    nickname: nickname ?? existing?.nickname,
-    rights,
-    invite_chain: chain,
-    verified_at: nowSeconds(),
-    historical,
-  };
-  members.set(nodeId, record);
-  await store.put("members", nodeId, record);
-  flushPending(nodeId);
-  return true;
-}
-
-/**
- * Verify pubkey+chain against the network and (current) revocation set.
- * `forHistory` relaxes only certificate expiry: it lets a new node
- * authenticate chat history written by members whose certs later lapsed,
- * but is never used for live connections or NS-write authorization.
- */
-async function verifyMembership(
-  pubkey: string,
-  chain: InviteCertificate[],
-  forHistory = false,
-): Promise<{ ok: boolean; rights: Right[]; reason?: string }> {
-  if (!config) return { ok: false, rights: [], reason: "not joined" };
-  // open room: anyone with a valid key is a member (no invite chain). Sybil
-  // resistance is JOIN proof-of-work + the local trust score.
-  if (config.open) return { ok: true, rights: ["join", "chat", "store"] };
-  return verifyInviteChain(config.network_id, chain, pubkey, nowSeconds(), revocations, forHistory);
-}
-
-function flushPending(origin: NodeId): void {
-  const pending = pendingEntries.get(origin);
-  if (!pending || !chatLog) return;
-  pendingEntries.delete(origin);
-  pendingEntryTotal -= pending.entries.length;
-  const added = chatLog.merge(pending.entries);
-  if (added.length) {
-    void persistChat();
-    renderChat();
-  }
-}
-
-function genesisPubkeyHex(): string | undefined {
-  return genesisKeys?.publicKeyHex ?? inviteChain[0]?.issuer_pubkey;
-}
-
-/**
- * Name Service write authorization: records are only merged when their
- * author is the genesis key, ourselves, or a verified member. Prevents a
- * non-member (whose events a relay might still carry) from poisoning
- * replicated names with high-version records.
- */
-function isAuthorizedNsAuthor(pubkey: string): boolean {
-  if (pubkey === genesisPubkeyHex() || pubkey === nodeKeys?.publicKeyHex) return true;
-  for (const member of members.values()) {
-    if (member.pubkey === pubkey && !member.historical) return true;
-  }
-  return false;
-}
-
-/**
- * A pubkey plausibly authorized to publish a revocation: genesis, ourselves,
- * any known member (live or historical), or any pubkey that appears as an
- * issuer in a known member's invite chain (i.e. a real inviter, even one we've
- * never connected to). Whether the revocation actually has effect is still
- * decided by `isCertRevoked` (issuer/genesis only) — this bound only limits
- * who may seed a stored `revoked/` record, keeping the namespace from being
- * spammed by arbitrary throwaway keys while never dropping a genuine one.
- */
-function isPlausibleRevoker(pubkey: string): boolean {
-  if (pubkey === genesisPubkeyHex() || pubkey === nodeKeys?.publicKeyHex) return true;
-  for (const member of members.values()) {
-    if (member.pubkey === pubkey) return true;
-    for (const cert of member.invite_chain) {
-      if (cert.issuer_pubkey === pubkey) return true;
-    }
-  }
-  return false;
-}
-
-async function mergeNsRecords(records: NameRecord[], from?: NodeId): Promise<boolean> {
-  if (!nameService) return false;
-  const merged: NameRecord[] = [];
-  for (const record of records ?? []) {
-    if (!record || typeof record.author_pubkey !== "string") continue;
-    // Revocation records are gated by plausible-revoker (not live-membership),
-    // because a node may need to honor a revocation issued by an authority it
-    // has never verified as a live peer. Their real authority is enforced by
-    // isCertRevoked at chain-verification time; the structural validity
-    // (author binding, value shape) is enforced inside NameServiceStore.merge.
-    const isRevocation = record.name.startsWith(REVOKED_PREFIX);
-    if (isRevocation && !isValidRevocationRecord(record)) {
-      // a malformed record squatting the revoked/ namespace is an attack signal
-      if (from) reputation.record(from, "bad-revocation");
-      continue;
-    }
-    const allowed = isRevocation
-      ? isPlausibleRevoker(record.author_pubkey)
-      : isAuthorizedNsAuthor(record.author_pubkey);
-    if (!allowed) continue;
-    if (await nameService.merge(record)) merged.push(record);
-  }
-  if (merged.length) {
-    await persistNs();
-    await applyRevocations();
-    await adoptBootstrapRelays();
-    renderNs();
-    // gossip newly-won records onward (terminates: re-merge returns false)
-    mesh?.broadcast({ t: "NS", records: merged }, from);
-  }
-  return merged.length > 0;
-}
-
-/**
- * Bootstrap relay adoption (design doc §10.2): the genesis node publishes a
- * signed `bootstrap` relay-set. Non-genesis nodes adopt any new relays from
- * it, so the network can migrate/add relays WITHOUT changing the fixed URL.
- * Only the genesis-authored record is trusted, and we only ever ADD relays
- * (never drop the operator's own), keeping connectivity resilient.
- */
-async function adoptBootstrapRelays(): Promise<void> {
-  if (!config || !nameService || !pool || config.is_genesis) return;
-  const boot = nameService.resolve("bootstrap");
-  if (!boot || boot.author_pubkey !== genesisPubkeyHex()) return;
-  const value = boot.value as { kind?: string; relays?: unknown };
-  if (value?.kind !== "relay-set" || !Array.isArray(value.relays)) return;
-  const advertised = value.relays.filter(
-    (r): r is string => typeof r === "string" && /^wss?:\/\//.test(r),
-  );
-  const fresh = advertised.filter((r) => !config!.relays.includes(r)).slice(0, 8);
-  if (fresh.length === 0) return;
-  config.relays = [...config.relays, ...fresh];
-  await store.put("kv", "config", config);
-  for (const url of fresh) {
-    pool.addRelay(url);
-    log(`adopted bootstrap relay: ${url}`);
-  }
-  renderRelays();
-}
-
-/** Re-check every member and live peer against the latest revocation set. */
-async function applyRevocations(): Promise<void> {
-  if (!config || !nameService) return;
-  revocations = nameService.revocations();
-  if (revocations.size === 0) return;
-  for (const [nodeId, member] of [...members]) {
-    if (member.invite_chain.length === 0) continue; // genesis node
-    // historical members are only re-checked for revocation, not expiry
-    const check = await verifyMembership(member.pubkey, member.invite_chain, member.historical ?? false);
-    if (!check.ok) {
-      members.delete(nodeId);
-      await store.delete("members", nodeId);
-      mesh?.removePeer(nodeId);
-      log(`member ${short(nodeId)} removed: ${check.reason}`);
-      toast(`メンバー ${short(nodeId)} の招待が失効しました`, "info");
-    }
-  }
-  if (nodeKeys && !genesisKeys) {
-    const own = await verifyMembership(nodeKeys.publicKeyHex, inviteChain);
-    if (!own.ok) {
-      toast(`あなたの招待は失効しています: ${own.reason}`, "error");
-    }
-  }
-  renderPeers();
-}
-
-// ---------------------------------------------------------------------------
-// Setup flows
-// ---------------------------------------------------------------------------
-
-/** Default flow: join an OPEN room by name (invite-less, auto-discovery). */
-async function joinRoom(room: string, nickname: string, relays: string[]): Promise<void> {
-  const roomName = normalizeRoom(room) || "lobby";
-  const networkId = await openNetworkId(roomName);
-  // reuse a persisted node key if we have one, else generate
-  let stored = await store.get<StoredKeyPair>("kv", "nodeKeys");
-  if (!stored) {
-    stored = await exportKeyPair(await generateKeyPair());
-    await store.put("kv", "nodeKeys", stored);
-  }
-  await store.delete("kv", "genesisKeys");
-  await store.put("kv", "inviteChain", []);
-  const cfg: NodeConfig = {
-    network_id: networkId,
-    relays: relays.length ? relays : defaultRelays(),
-    nickname,
-    is_genesis: false,
-    open: true,
-    room: roomName,
-  };
-  await store.put("kv", "config", cfg);
-  log(`joining open room "${roomName}"`);
-  await boot();
-}
-
-/** Advanced: create a private, invite-only network (genesis-rooted). */
-async function createNetwork(nickname: string, relays: string[]): Promise<void> {
-  const genesis = await generateKeyPair();
-  const node = await generateKeyPair();
-  const networkId = await networkIdFromGenesisPubkey(genesis.publicKeyHex);
-  const cert = await issueCertificate({
-    networkId,
-    issuer: genesis,
-    subjectPubkey: node.publicKeyHex,
-    rights: ["join", "invite", "chat", "store", "admin"],
-  });
-  await store.put("kv", "genesisKeys", await exportKeyPair(genesis));
-  await store.put("kv", "nodeKeys", await exportKeyPair(node));
-  await store.put("kv", "inviteChain", [cert]);
-  const cfg: NodeConfig = {
-    network_id: networkId,
-    relays: relays.length ? relays : defaultRelays(),
-    nickname,
-    is_genesis: true,
-    open: false,
-  };
-  await store.put("kv", "config", cfg);
-  toast(`招待制ネットワークを作成しました`, "ok");
-  log(`network created: ${anpUrl(networkId)}`);
-  await boot();
-}
-
-async function prepareJoinRequest(): Promise<string> {
-  let storedKeys = await store.get<StoredKeyPair>("kv", "pendingKeys");
-  if (!storedKeys) {
-    const keys = await generateKeyPair();
-    storedKeys = await exportKeyPair(keys);
-    await store.put("kv", "pendingKeys", storedKeys);
-  }
-  return storedKeys.publicKeyHex;
-}
-
-async function acceptInvite(bundleText: string, nickname: string): Promise<void> {
-  const bundle: InviteBundle = decodeInviteBundle(bundleText);
-  const storedKeys = await store.get<StoredKeyPair>("kv", "pendingKeys");
-  if (!storedKeys) throw new Error("先に参加リクエストコードを作成してください");
-  const check = await verifyInviteChain(bundle.network_id, bundle.chain, storedKeys.publicKeyHex);
-  if (!check.ok) throw new Error(`招待証明書が不正です: ${check.reason}`);
-  await store.put("kv", "nodeKeys", storedKeys);
-  await store.put("kv", "inviteChain", bundle.chain);
-  await store.delete("kv", "pendingKeys");
-  const cfg: NodeConfig = {
-    network_id: bundle.network_id,
-    relays: bundle.relays.length ? bundle.relays : defaultRelays(),
-    nickname,
-    is_genesis: false,
-    open: false,
-  };
-  await store.put("kv", "config", cfg);
-  toast("参加しました", "ok");
-  log(`invite accepted for ${anpUrl(bundle.network_id)}`);
-  history.replaceState(null, "", location.pathname); // drop #invite=… from the URL
-  await boot();
-}
-
-/** Issue a certificate for `subjectPubkey`, returning the full chain that
- * authorizes them (shared by online invites and offline offers). */
-async function buildInviteChain(
-  subjectPubkey: string,
-  grantInvite: boolean,
-): Promise<{ chain: InviteCertificate[]; cert: InviteCertificate }> {
-  if (!config || !nodeKeys) throw new Error("not joined");
-  const rights: Right[] = grantInvite ? ["join", "invite", "chat", "store"] : ["join", "chat", "store"];
-  let chain: InviteCertificate[];
-  let cert: InviteCertificate;
-  if (genesisKeys) {
-    // creator: issue directly from the genesis key — shortest possible chain
-    cert = await issueCertificate({ networkId: config.network_id, issuer: genesisKeys, subjectPubkey, rights });
-    chain = [cert];
-  } else {
-    if (!myRights.includes("invite")) throw new Error("このノードには招待権がありません");
-    cert = await issueCertificate({ networkId: config.network_id, issuer: nodeKeys, subjectPubkey, rights });
-    chain = [...inviteChain, cert];
-  }
-  issuedInvites.push({
-    invite_id: cert.invite_id,
-    subject_pubkey: subjectPubkey,
-    rights,
-    issued_at: nowSeconds(),
-    issued_by: genesisKeys ? "genesis" : "node",
-  });
-  await persistIssued();
-  renderInvites();
-  return { chain, cert };
-}
-
-async function issueInvite(subjectPubkey: string, grantInvite: boolean): Promise<{ bundle: string; link: string }> {
-  if (!config || !nodeKeys) throw new Error("not joined");
-  if (!/^[0-9a-f]{130}$/.test(subjectPubkey)) throw new Error("参加リクエストコードの形式が不正です");
-  const { chain } = await buildInviteChain(subjectPubkey, grantInvite);
-  const bundle: InviteBundle = {
-    v: 1,
-    network_id: config.network_id,
-    genesis_pubkey: genesisKeys?.publicKeyHex ?? inviteChain[0]!.issuer_pubkey,
-    relays: config.relays,
-    chain,
-  };
-  const encoded = encodeInviteBundle(bundle);
-  const link = location.protocol.startsWith("http")
-    ? `${location.origin}${location.pathname}#invite=${encoded}`
-    : "";
-  return { bundle: encoded, link };
-}
-
-async function revokeInvite(inviteId: string): Promise<void> {
-  if (!config || !nodeKeys || !nameService || !pool) throw new Error("not joined");
-  const invite = issuedInvites.find((inv) => inv.invite_id === inviteId);
-  if (!invite) throw new Error("unknown invite");
-  const keys = invite.issued_by === "genesis" ? genesisKeys : nodeKeys;
-  if (!keys) throw new Error("発行鍵がありません");
-  // per-author revocation slot: `revoked/<invite_id>/<my pubkey>`. Nobody can
-  // overwrite or forge another authority's slot (see nameservice.ts).
-  const name = revocationName(inviteId, keys.publicKeyHex);
-  const existing = nameService.resolve(name);
-  const record = await createNameRecord(
-    config.network_id,
-    keys,
-    name,
-    { kind: "revocation", invite_id: inviteId },
-    (existing?.version ?? 0) + 1,
-    365 * 24 * 3600, // revocations live long
-  );
-  await nameService.merge(record);
-  await persistNs();
-  invite.revoked = true;
-  await persistIssued();
-
-  // Propagate the revocation BEFORE ejecting anyone. Ejection closes our
-  // DataChannels to the affected peers, and a channel close can discard
-  // still-buffered sends — so if we ejected first, a directly-connected
-  // revoked peer (and its downstream) might never learn it was revoked and
-  // would keep vouching for the sub-tree. Broadcast to every peer, publish to
-  // the relays (re-announcing our JOIN first so the relay membership gate
-  // accepts the manifest even right after a relay restart), let it flush,
-  // then apply locally.
-  mesh?.broadcast({ t: "NS", records: [record] });
-  await refreshJoin(true);
-  const manifest = await createManifest(config.network_id, nodeKeys, {
-    relays: config.relays,
-    records: [record],
-  });
-  pool.publish(manifest);
-  renderInvites();
-  renderNs();
-  toast(`招待 ${inviteId} を失効させました`, "ok");
-
-  // give the P2P broadcast a moment to flush before we tear channels down,
-  // then apply; re-publish once more so late reconnbers still catch it
-  await new Promise((r) => setTimeout(r, 800));
-  await applyRevocations();
-  pool.publish(manifest);
-}
-
-interface IdentityExport {
-  v: 1;
-  config: NodeConfig;
-  nodeKeys: StoredKeyPair;
-  genesisKeys?: StoredKeyPair;
-  inviteChain: InviteCertificate[];
-  issuedInvites: IssuedInvite[];
-}
-
-async function exportIdentity(): Promise<void> {
-  if (!config || !nodeStoredKeys) throw new Error("not joined");
-  const payload: IdentityExport = {
-    v: 1,
-    config,
-    nodeKeys: nodeStoredKeys,
-    genesisKeys: await store.get<StoredKeyPair>("kv", "genesisKeys"),
-    inviteChain,
-    issuedInvites,
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `anp-identity-${config.network_id.slice(0, 8)}.json`;
-  a.click();
-  URL.revokeObjectURL(a.href);
-  toast("identity をエクスポートしました (秘密鍵を含みます — 取り扱い注意)", "info");
-}
-
-async function importIdentity(text: string): Promise<void> {
-  const payload = JSON.parse(text) as IdentityExport;
-  if (payload.v !== 1 || !payload.config?.network_id || !payload.nodeKeys?.privateJwk) {
-    throw new Error("identity ファイルの形式が不正です");
-  }
-  await store.put("kv", "config", payload.config);
-  await store.put("kv", "nodeKeys", payload.nodeKeys);
-  if (payload.genesisKeys) await store.put("kv", "genesisKeys", payload.genesisKeys);
-  await store.put("kv", "inviteChain", payload.inviteChain ?? []);
-  await store.put("kv", "issuedInvites", payload.issuedInvites ?? []);
-  toast("identity をインポートしました", "ok");
-  location.reload();
-}
-
-// ---------------------------------------------------------------------------
-// Node runtime
-// ---------------------------------------------------------------------------
-
-let nodeStarted = false;
-
-async function startNode(): Promise<void> {
-  if (!config || !nodeKeys || !nodeStoredKeys) return;
-  if (nodeStarted) return; // re-entry guard: never run two node runtimes
-  nodeStarted = true;
-  myNodeId = await nodeIdFromPubkey(nodeKeys.publicKeyHex);
-  const ecdhKey = await importPrivateKeyForEcdh(nodeStoredKeys.privateJwk);
-
-  // rights: open rooms grant chat/store to everyone; invite networks derive
-  // them from the local invite chain (verifyMembership handles both)
-  const chainCheck = await verifyMembership(nodeKeys.publicKeyHex, inviteChain);
-  myRights = chainCheck.ok ? chainCheck.rights : [];
-  if (!chainCheck.ok && !genesisKeys && !config.open) {
-    log(`warning: local invite chain invalid (${chainCheck.reason})`);
-    toast(`招待チェーンが無効です: ${chainCheck.reason}`, "error");
-  }
-
-  // per-log-instance epoch: keeps entry ids unique even if this identity is
-  // restored elsewhere or the local seq counter is lost (see crdt.ts)
-  let epoch = await store.get<string>("kv", "epoch");
-  if (!epoch) {
-    epoch = randomHex(4);
-    await store.put("kv", "epoch", epoch);
-  }
-  const replica = `${myNodeId}.${epoch}`;
-  chatLog = GSetLog.fromJSON(replica, (await store.get<LogEntry[]>("crdt", "chat")) ?? []);
-  profileMap = LwwMap.fromJSON(replica, (await store.get<Record<string, LwwCell>>("crdt", "profile")) ?? {});
-  nameService = new NameServiceStore(config.network_id);
-  nameService.load(await store.all<NameRecord>("ns"));
-  for (const member of await store.all<MemberRecord>("members")) {
-    members.set(member.node_id, member);
-  }
-  revocations = nameService.revocations();
-
-  // trust scores (Phase 4): persisted per peer, decayed on every restart
-  reputation = Reputation.fromJSON(await store.all<PeerScore>("peers"));
-  reputation.onChange = (record) => {
-    void store.put("peers", record.node_id, record);
-  };
-
-  // publish own (signed) nickname cell
-  const nickKey = `nickname/${myNodeId}`;
-  if (profileMap.get(nickKey) !== config.nickname) {
-    const cell = profileMap.set(nickKey, config.nickname);
-    await signCell(nodeKeys.privateKey, nodeKeys.publicKeyHex, nickKey, cell);
-    await persistProfile();
-  }
-
-  mesh = new Mesh(config.network_id, nodeKeys, ecdhKey, myNodeId, {
-    publishEvent: (event) => pool?.publish(event),
-    onPeerOpen: (peer) => {
-      reputation.record(peer.node_id, "connect");
-      sendHello(peer.node_id);
-      if (chatLog && profileMap) {
-        mesh?.send(peer.node_id, {
-          t: "SYNC_REQ",
-          chat_vv: chatLog.versionVector(),
-          profile_lamport: 0,
-        });
-      }
-      renderPeers();
-      renderConn();
-    },
-    onPeerClose: (nodeId, reason) => {
-      if (reason === "keepalive timeout") reputation.record(nodeId, "keepalive-timeout");
-      else if (reason?.startsWith("pc ")) reputation.record(nodeId, "pc-failed");
-      renderPeers();
-      renderConn();
-    },
-    onMessage: (from, msg) => void handleDcMessage(from, msg),
-    log,
-  });
-  files = new FileService(store, mesh, log, {
-    rankPeers: (ids) => reputation.rank(ids),
-    onOutcome: (peer, ok) => {
-      reputation.record(peer, ok ? "file-served" : "file-failed");
-      renderPeers();
-    },
-  });
-
-  pool = new RelayPool({
-    urls: config.relays,
-    filter: { network_id: config.network_id, target: myNodeId },
-    onEvent: (event) => void handleRelayEvent(event),
-    onStatus: (url, connected) => {
-      renderRelays();
-      if (connected) void announce();
-    },
-  });
-  pool.start();
-
-  timers.push(
-    window.setInterval(() => void heartbeat(), HEARTBEAT_INTERVAL * 1000),
-    window.setInterval(() => void refreshJoin(), 240_000),
-    window.setInterval(() => {
-      mesh?.prune(nowSeconds(), HEARTBEAT_TTL * 2);
-      renderPeers();
-    }, 20_000),
-    window.setInterval(() => void publishManifest(), 5 * 60_000),
-    window.setInterval(() => renderRelays(), 5_000),
-    // periodic anti-entropy: exchange deltas with one random connected peer,
-    // healing any divergence that one-shot open-time syncs missed
-    window.setInterval(() => {
-      if (!mesh || !chatLog) return;
-      const peers = mesh.connectedNodeIds();
-      if (peers.length === 0) return;
-      const peer = peers[Math.floor(Math.random() * peers.length)]!;
-      mesh.send(peer, { t: "SYNC_REQ", chat_vv: chatLog.versionVector(), profile_lamport: 0 });
-    }, ANTI_ENTROPY_MS),
-  );
-
-  latestLeave = await createLeave(config.network_id, nodeKeys);
-  showMain();
-  renderAll();
-  log(`node started: ${short(myNodeId)} on ${anpUrl(config.network_id)} (proto v2)`);
-}
-
-let announced = false;
-
-/** Publish (or re-publish) our JOIN; mining PoW happens off the UI thread's hot path. */
-async function refreshJoin(force = false): Promise<void> {
-  if (!config || !nodeKeys || !pool) return;
-  const now = nowSeconds();
-  if (!force && cachedJoin && cachedJoin.expires_at - now > JOIN_TTL / 3) {
-    pool.publish(cachedJoin);
-    return;
-  }
-  cachedJoin = config.open
-    ? await createJoin(config.network_id, nodeKeys, [], {
-        open: true,
-        room: config.room,
-        nickname: config.nickname,
-      })
-    : await createJoin(config.network_id, nodeKeys, inviteChain, config.nickname);
-  pool.publish(cachedJoin);
-}
-
-async function announce(): Promise<void> {
-  await refreshJoin();
-  // Re-publish the manifest on every (re)connect, not just the first time.
-  // After a relay restart the relay's store is empty, so re-announcing our
-  // JOIN and manifest re-seeds discovery and re-propagates any revocations we
-  // know about. refreshJoin() ran first, so the membership gate accepts it.
-  announced = true;
-  await publishManifest();
-}
-
-async function heartbeat(): Promise<void> {
-  if (!config || !nodeKeys || !pool) return;
-  pool.publish(await createHeartbeat(config.network_id, nodeKeys));
-  // keep a fresh pre-signed LEAVE around for sendBeacon on page close
-  latestLeave = await createLeave(config.network_id, nodeKeys);
-}
-
-async function publishManifest(): Promise<void> {
-  if (!config || !nodeKeys || !pool || !nameService) return;
-  const existing = nameService.resolve(`node/${myNodeId}`);
-  const record = await createNameRecord(
-    config.network_id,
-    nodeKeys,
-    `node/${myNodeId}`,
-    { kind: "node", nickname: config.nickname, node_id: myNodeId },
-    (existing?.version ?? 0) + 1,
-    600,
-  );
-  await nameService.merge(record);
-  if (config.is_genesis) {
-    const boot = nameService.resolve("bootstrap");
-    const bootRecord = await createNameRecord(
-      config.network_id,
-      nodeKeys,
-      "bootstrap",
-      { kind: "relay-set", relays: config.relays },
-      (boot?.version ?? 0) + 1,
-      3600,
-    );
-    await nameService.merge(bootRecord);
-  }
-  await persistNs();
-  pool.publish(
-    await createManifest(config.network_id, nodeKeys, {
-      relays: config.relays,
-      records: nameService.all(),
-    }),
-  );
-  renderNs();
-}
-
-async function handleRelayEvent(event: AnpEvent): Promise<void> {
-  if (!mesh || !nameService) return;
-
-  // trust score enforcement: fully ignore peers at or below the ban line
-  if (event.node_id !== myNodeId && reputation.isBanned(event.node_id)) return;
-
-  if (event.type === "JOIN" && event.node_id !== myNodeId) {
-    // relayclient verified signature/chain; additionally enforce revocations
-    const join = event as JoinEvent;
-    const check = await verifyMembership(event.pubkey, join.body.invite_chain);
-    if (!check.ok) {
-      log(`JOIN from ${short(event.node_id)} rejected: ${check.reason}`);
-      return;
-    }
-    await registerMember(event.node_id, event.pubkey, join.body.invite_chain, join.body.nickname, check.rights);
-  }
-
-  await mesh.handleDiscoveryEvent(event);
-
-  if (event.type === "MANIFEST") {
-    await mergeNsRecords(event.body.records ?? []);
-  }
-  if (event.type === "JOIN" || event.type === "HEARTBEAT" || event.type === "LEAVE") renderPeers();
-}
-
-// ---------------------------------------------------------------------------
-// DataChannel sync
-//
-// DataChannels are implicitly authenticated: the SDP that established them
-// was ECIES-encrypted to the peer's node key, so only that key's holder can
-// be on the other end. CRDT payloads are additionally signed per entry.
-// ---------------------------------------------------------------------------
-
-function sendHello(to: NodeId): void {
-  if (!mesh || !nodeKeys || !config) return;
-  mesh.send(to, {
-    t: "HELLO",
-    node_id: myNodeId,
-    pubkey: nodeKeys.publicKeyHex,
-    nickname: config.nickname,
-    chain: inviteChain,
-    peers: [...mesh.peers.values()],
-  });
-}
-
-function requestProof(origin: NodeId, from: NodeId): void {
-  const last = proofRequested.get(origin) ?? 0;
-  if (Date.now() - last < 10_000) return;
-  // bound the map: drop the oldest entries once it grows too large
-  if (proofRequested.size >= MAX_PROOF_REQUESTED) {
-    const cutoff = Date.now() - 10_000;
-    for (const [nodeId, ts] of proofRequested) {
-      if (ts < cutoff) proofRequested.delete(nodeId);
-    }
-    if (proofRequested.size >= MAX_PROOF_REQUESTED) {
-      const first = proofRequested.keys().next().value;
-      if (first) proofRequested.delete(first);
-    }
-  }
-  proofRequested.set(origin, Date.now());
-  mesh?.send(from, { t: "MEMBER_REQ", node_id: origin });
-}
-
-/** Shape validation per entry kind — a malformed entry must never be able to
- * poison the persisted log or break rendering. */
-function validEntryData(entry: LogEntry): boolean {
-  if (entry.kind === "chat") {
-    const data = entry.data as { text?: unknown };
-    return typeof data?.text === "string" && data.text.length <= 4096;
-  }
-  if (entry.kind === "file") {
-    const meta = entry.data as Partial<FileMeta>;
-    return (
-      typeof meta?.cid === "string" &&
-      /^cid:sha256:[0-9a-f]{64}$/.test(meta.cid) &&
-      typeof meta.name === "string" &&
-      meta.name.length <= 256 &&
-      typeof meta.size === "number" &&
-      meta.size >= 0
-    );
-  }
-  return true;
-}
-
-async function acceptChatEntries(from: NodeId, entries: LogEntry[]): Promise<void> {
-  if (!chatLog || !mesh) return;
-  // bound work per delta: a peer cannot force an unbounded ECDSA-verify storm
-  const batch = (entries ?? []).slice(0, MAX_ENTRIES_PER_DELTA);
-  const mergeable: LogEntry[] = [];
-  let anyValid = false;
-  for (const entry of batch) {
-    if (typeof entry?.id !== "string") continue;
-    if (!validEntryData(entry)) {
-      reputation.record(from, "forged-entry"); // malformed shape from this peer
-      continue;
-    }
-    if (!(await verifyLogEntry(entry))) {
-      reputation.record(from, "forged-entry"); // bad signature / origin binding
-      continue;
-    }
-    anyValid = true;
-    const originNode = replicaNodeId(entry.origin);
-    if (originNode === myNodeId || members.has(originNode)) {
-      mergeable.push(entry);
-    } else {
-      // hold until the origin's membership is proven — but bound both the
-      // number of distinct unproven origins and the total buffered entries, so
-      // a peer streaming forged-origin (yet validly self-signed) entries can't
-      // exhaust memory
-      let pending = pendingEntries.get(originNode);
-      if (!pending) {
-        if (pendingEntries.size >= MAX_PENDING_ORIGINS) evictOldestPending();
-        pending = { entries: [], since: Date.now() };
-        pendingEntries.set(originNode, pending);
-      }
-      if (pendingEntryTotal < MAX_PENDING) {
-        pending.entries.push(entry);
-        pendingEntryTotal++;
-      }
-      requestProof(originNode, from);
-    }
-  }
-  if (anyValid) reputation.record(from, "valid-sync");
-  const added = chatLog.merge(mergeable);
-  if (added.length) {
-    await persistChat();
-    renderChat();
-    // gossip: forward what was new to us to every other peer, so entries
-    // still propagate across partial meshes (A—hub—C without an A—C link)
-    mesh.broadcast({ t: "CHAT_DELTA", entries: added }, from);
-  }
-}
-
-async function handleDcMessage(from: NodeId, msg: DcMessage): Promise<void> {
-  if (!mesh || !chatLog || !profileMap || !nameService || !files) return;
-
-  // trust score enforcement: drop the link and ignore banned peers entirely
-  if (reputation.isBanned(from)) {
-    mesh.removePeer(from);
-    return;
-  }
-
-  if (await files.handleMessage(from, msg)) return;
-
-  switch (msg.t) {
-    case "HELLO": {
-      if (msg.node_id !== from) return;
-      const check = await verifyMembership(msg.pubkey, msg.chain ?? []);
-      if (check.ok && (await nodeIdFromPubkey(msg.pubkey)) === from) {
-        await registerMember(from, msg.pubkey, msg.chain ?? [], msg.nickname, check.rights);
-        const peer = mesh.peers.get(from);
-        if (peer) {
-          peer.nickname = msg.nickname ?? peer.nickname;
-          peer.rights = check.rights;
-        }
-      }
-      // peer-table gossip: ask for proofs of members we haven't verified
-      let asked = 0;
-      for (const info of msg.peers ?? []) {
-        if (
-          asked < 20 &&
-          info?.node_id &&
-          info.node_id !== myNodeId &&
-          !members.has(info.node_id) &&
-          !mesh.peers.has(info.node_id)
-        ) {
-          requestProof(info.node_id, from);
-          asked++;
-        }
-      }
-      renderPeers();
-      break;
-    }
-    case "MEMBER_REQ": {
-      if (msg.node_id === myNodeId && nodeKeys && config) {
-        mesh.send(from, {
-          t: "MEMBER_PROOF",
-          node_id: myNodeId,
-          pubkey: nodeKeys.publicKeyHex,
-          nickname: config.nickname,
-          chain: inviteChain,
-        });
-      } else {
-        const member = members.get(msg.node_id);
-        if (member) {
-          mesh.send(from, {
-            t: "MEMBER_PROOF",
-            node_id: member.node_id,
-            pubkey: member.pubkey,
-            nickname: member.nickname,
-            chain: member.invite_chain,
-          });
-        }
-      }
-      break;
-    }
-    case "MEMBER_PROOF": {
-      if ((await nodeIdFromPubkey(msg.pubkey)) !== msg.node_id) return;
-      const live = await verifyMembership(msg.pubkey, msg.chain ?? []);
-      if (live.ok) {
-        await registerMember(msg.node_id, msg.pubkey, msg.chain ?? [], msg.nickname, live.rights);
-        // make gossiped members visible as connectable peers
-        if (msg.node_id !== myNodeId && !mesh.peers.has(msg.node_id)) {
-          mesh.peers.set(msg.node_id, {
-            node_id: msg.node_id,
-            pubkey: msg.pubkey,
-            nickname: msg.nickname,
-            last_seen: nowSeconds(),
-            rights: live.rights,
-          });
-        }
-        renderPeers();
-        break;
-      }
-      // fall back to history-only membership (cert expired but not revoked):
-      // authenticates their past chat entries without granting live standing
-      const historical = await verifyMembership(msg.pubkey, msg.chain ?? [], true);
-      if (historical.ok) {
-        await registerMember(msg.node_id, msg.pubkey, msg.chain ?? [], msg.nickname, [], true);
-      }
-      break;
-    }
-    case "SYNC_REQ": {
-      mesh.send(from, { t: "CHAT_DELTA", entries: chatLog.entriesMissingFrom(msg.chat_vv ?? {}) });
-      // profile deltas use a plain lamport watermark; requesters always send 0
-      // (full resend) because the cell set is tiny — unlike chat, no VV needed
-      mesh.send(from, { t: "PROFILE_DELTA", cells: profileMap.changedSince(msg.profile_lamport ?? 0) });
-      mesh.send(from, { t: "NS", records: nameService.all() });
-      break;
-    }
-    case "CHAT_DELTA": {
-      await acceptChatEntries(from, msg.entries ?? []);
-      break;
-    }
-    case "PROFILE_DELTA": {
-      const verified: Record<string, LwwCell> = {};
-      for (const [key, cell] of Object.entries(msg.cells ?? {})) {
-        if (await verifyCell(key, cell)) verified[key] = cell;
-      }
-      const changed = profileMap.merge(verified);
-      if (changed.length) {
-        await persistProfile();
-        renderPeers();
-        renderChat();
-        // gossip changed cells onward for partial meshes
-        const forward: Record<string, LwwCell> = {};
-        for (const key of changed) {
-          const cell = profileMap.getCell(key);
-          if (cell) forward[key] = cell;
-        }
-        mesh.broadcast({ t: "PROFILE_DELTA", cells: forward }, from);
-      }
-      break;
-    }
-    case "NS": {
-      await mergeNsRecords(msg.records ?? [], from);
-      break;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Chat + files
-// ---------------------------------------------------------------------------
-
-async function appendSignedEntry(kind: string, data: unknown): Promise<LogEntry | undefined> {
-  if (!chatLog || !mesh || !nodeKeys) return undefined;
-  const entry = chatLog.append(kind, data, nowSeconds());
-  await signLogEntry(nodeKeys.privateKey, nodeKeys.publicKeyHex, entry);
-  await persistChat();
-  mesh.broadcast({ t: "CHAT_DELTA", entries: [entry] });
-  renderChat();
-  return entry;
-}
-
-async function sendChat(text: string): Promise<void> {
-  if (!myRights.includes("chat")) {
-    toast("このノードには chat 権限がありません", "error");
-    return;
-  }
-  await appendSignedEntry("chat", { text });
-}
-
-async function shareFile(file: File): Promise<void> {
-  if (!files) return;
-  if (!myRights.includes("store")) {
-    toast("このノードには store 権限がありません", "error");
-    return;
-  }
-  const meta = await files.shareFile(file);
-  await appendSignedEntry("file", meta);
-  toast(`${file.name} を共有しました`, "ok");
-}
-
-const downloading = new Set<string>();
-
-async function downloadFile(meta: FileMeta): Promise<void> {
-  if (!files || downloading.has(meta.cid)) return;
-  downloading.add(meta.cid);
-  renderChat();
-  try {
-    const bytes = await files.fetchBlob(meta.cid);
-    const blob = new Blob([bytes as BlobPart], { type: meta.mime || "application/octet-stream" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = meta.name || "file";
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast(`${meta.name} を取得しました (CID検証済み)`, "ok");
-  } catch (err) {
-    toast(`取得失敗: ${(err as Error).message}`, "error");
-  } finally {
-    downloading.delete(meta.cid);
-    renderChat();
-  }
-}
-
-async function publishRecord(name: string, valueText: string): Promise<void> {
-  if (!config || !nodeKeys || !nameService || !mesh || !pool) return;
-  if (!myRights.includes("store")) throw new Error("このノードには store 権限がありません");
-  let value: unknown;
-  try {
-    value = JSON.parse(valueText);
-  } catch {
-    // looks like intended JSON but doesn't parse — surface the mistake
-    if (/^\s*[[{]/.test(valueText)) throw new Error("value の JSON が不正です");
-    value = valueText;
-  }
-  const existing = nameService.resolve(name);
-  const record = await createNameRecord(
-    config.network_id,
-    nodeKeys,
-    name,
-    value,
-    (existing?.version ?? 0) + 1,
-  );
-  await nameService.merge(record);
-  await persistNs();
-  mesh.broadcast({ t: "NS", records: [record] });
-  pool.publish(
-    await createManifest(config.network_id, nodeKeys, { relays: config.relays, records: [record] }),
-  );
-  renderNs();
-}
-
-// ---------------------------------------------------------------------------
-// Leave / reset
-// ---------------------------------------------------------------------------
-
-/** Tear down the running node. `forSwitch` resets state so a fresh startNode
- * (a room change) can run cleanly; otherwise the caller reloads the page. */
-async function leaveNetwork(forSwitch = false): Promise<void> {
-  if (config && nodeKeys && pool) {
-    pool.publish(await createLeave(config.network_id, nodeKeys));
-  }
-  mesh?.shutdown();
-  pool?.stop();
-  for (const t of timers) clearInterval(t);
-  timers = [];
-  // reset per-node runtime state
-  mesh = undefined;
-  pool = undefined;
-  files = undefined;
-  chatLog = undefined;
-  profileMap = undefined;
-  nameService = undefined;
-  members.clear();
-  pendingEntries.clear();
-  pendingEntryTotal = 0;
-  proofRequested.clear();
-  cachedJoin = undefined;
-  announced = false;
-  nodeStarted = false;
-  if (!forSwitch) log("left network");
-}
-
-let beaconSent = false;
-function sendLeaveBeacon(): void {
-  if (beaconSent || !config || !latestLeave) return;
-  beaconSent = true;
-  const body = JSON.stringify(latestLeave);
-  for (const relay of config.relays) {
-    try {
-      navigator.sendBeacon(`${relayHttpUrl(relay)}/event`, new Blob([body], { type: "application/json" }));
-    } catch {
-      /* best effort */
-    }
-  }
-}
-
-async function resetIdentity(): Promise<void> {
-  await leaveNetwork();
-  await store.clearAll();
-  location.reload();
-}
-
-// ---------------------------------------------------------------------------
-// Relay editing
-// ---------------------------------------------------------------------------
-
-async function addRelayUrl(url: string): Promise<void> {
-  if (!config || !pool) return;
-  if (!/^wss?:\/\//.test(url)) throw new Error("Relay URL は ws:// または wss:// で始めてください");
-  if (config.relays.includes(url)) throw new Error("既に追加済みです");
-  config.relays = [...config.relays, url];
-  await store.put("kv", "config", config);
-  pool.addRelay(url);
-  renderRelays();
-  toast(`Relay を追加しました`, "ok");
-}
-
-async function removeRelay(url: string): Promise<void> {
-  if (!config || !pool) return;
-  config.relays = config.relays.filter((r) => r !== url);
-  await store.put("kv", "config", config);
-  pool.removeRelay(url);
-  renderRelays();
-  toast(`Relay を削除しました`, "info");
-}
-
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-
-function showMain(): void {
-  $("welcome").hidden = true;
-  $("app").hidden = false;
-}
-
-function renderAll(): void {
-  renderTopbar();
-  renderConn();
-  renderIdentity();
-  renderRelays();
-  renderPeers();
-  renderChat();
-  renderNs();
-  renderInvites();
-}
-
-const AVATAR_COLORS = ["#6d5efc", "#e0567a", "#20a4a4", "#e0952b", "#3b82f6", "#8b5cf6", "#16a34a", "#db2777"];
-function avatarColor(id: string): string {
-  let h = 0;
-  for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return AVATAR_COLORS[h % AVATAR_COLORS.length]!;
-}
-function initial(name: string): string {
-  return (name.trim()[0] ?? "?").toUpperCase();
-}
-function avatarHtml(nodeId: string): string {
-  const name = nicknameOf(nodeId);
-  return `<span class="avatar" style="background:${avatarColor(nodeId)}">${escapeHtml(initial(name))}</span>`;
-}
-
-function renderTopbar(): void {
-  if (!config) return;
-  $("room-title").textContent = config.open ? `#${config.room ?? "lobby"}` : "🔒 招待制";
-}
-
-function renderConn(): void {
-  const connected = mesh ? mesh.connectedNodeIds().length : 0;
-  const relaysUp = pool ? pool.connectedCount() : 0;
-  const dot = $("conn-dot");
-  const text = $("conn-text");
-  dot.className = "dot";
-  if (connected > 0) {
-    dot.classList.add("ok");
-    text.textContent = `${connected}人と直接接続中`;
-  } else if (relaysUp > 0) {
-    dot.classList.add("warn");
-    text.textContent = "参加者を探索中…";
-  } else if (config && config.relays.length === 0) {
-    dot.classList.add("ng");
-    text.textContent = "Relay未設定（メニューから追加）";
-  } else {
-    dot.classList.add("ng");
-    text.textContent = "Relayに接続中…";
-  }
-}
-
-function renderIdentity(): void {
-  if (!config) return;
-  ($("d-nick") as HTMLInputElement).value = config.nickname;
-  $("d-node-id").textContent = short(myNodeId);
-  $("d-net-url").textContent = anpUrl(config.network_id);
-  $("d-role").textContent = config.open
-    ? `オープンルーム #${config.room ?? "lobby"}`
-    : config.is_genesis
-      ? "招待制（作成者）"
-      : "招待制（メンバー）";
-  // invite issuance only makes sense on an invite-only network we can invite into
-  $("invite-card").hidden = config.open || !(genesisKeys || myRights.includes("invite"));
-}
-
-function renderRelays(): void {
-  if (!pool) return;
-  const list = $("relay-list");
-  const stats = pool.statsSnapshot();
-  if (stats.length === 0) {
-    list.innerHTML = `<li class="muted">Relay 未設定（オープンルームは Relay で参加者を探します）</li>`;
-    return;
-  }
-  list.innerHTML = stats
-    .map(
-      (s) =>
-        `<li><span class="dot ${s.connected ? "ok" : "ng"}"></span>
-         <span style="flex:1;min-width:0;word-break:break-all">${escapeHtml(s.url)}</span>
-         <button class="btn small relay-rm" data-url="${escapeHtml(s.url)}">削除</button></li>`,
-    )
-    .join("");
-  for (const btn of list.querySelectorAll<HTMLButtonElement>(".relay-rm")) {
-    btn.onclick = () => void removeRelay(btn.dataset["url"]!).catch((e) => toast((e as Error).message, "error"));
-  }
-}
-
-function nicknameOf(nodeId: NodeId): string {
-  const nick = profileMap?.get(`nickname/${nodeId}`);
-  if (typeof nick === "string" && nick) return nick;
-  const member = members.get(nodeId);
-  if (member?.nickname) return member.nickname;
-  return mesh?.peers.get(nodeId)?.nickname ?? short(nodeId);
-}
-
-function renderPeers(): void {
-  if (!mesh) return;
-  const connected = new Set(mesh.connectedNodeIds());
-  const now = nowSeconds();
-  const peers = [...mesh.peers.values()].sort((a, b) => a.node_id.localeCompare(b.node_id));
-  const rows = peers.map((peer) => {
-    const online = connected.has(peer.node_id);
-    const seen = now - peer.last_seen <= HEARTBEAT_TTL * 2;
-    const dotClass = online ? "ok" : seen ? "warn" : "ng";
-    const state = online ? "接続中" : seen ? "発見済み" : "オフライン";
-    const score = Math.round(reputation.scoreOf(peer.node_id));
-    const banned = reputation.isBanned(peer.node_id);
-    const verified = members.has(peer.node_id) && !config?.open
-      ? `<span class="badge ok-badge">✓</span>`
-      : "";
-    const trust = banned
-      ? `<span class="badge ng-text">遮断</span>`
-      : score !== 0
-        ? `<span class="badge">信頼 ${score}</span>`
-        : "";
-    return `<li>${avatarHtml(peer.node_id)}
-      <div class="m-main">
-        <div class="m-name">${escapeHtml(nicknameOf(peer.node_id))}</div>
-        <div class="m-sub"><span class="dot ${dotClass}" style="width:7px;height:7px"></span>${state} ${verified} ${trust}</div>
-      </div>
-      ${score !== 0 ? `<button class="btn small trust-reset" data-id="${escapeHtml(peer.node_id)}">リセット</button>` : ""}
-    </li>`;
-  });
-  $("member-list").innerHTML = rows.join("") || `<li class="muted">まだ他の参加者がいません</li>`;
-  $("peer-count").textContent = String(connected.size);
-  for (const btn of $("member-list").querySelectorAll<HTMLButtonElement>(".trust-reset")) {
-    btn.onclick = () => {
-      const id = btn.dataset["id"]!;
-      reputation.reset(id);
-      void store.delete("peers", id);
-      renderPeers();
-    };
-  }
-}
-
-let lastChatCount = 0;
-function renderChat(): void {
-  if (!chatLog) return;
-  const box = $("chat-box");
-  const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 60;
-  const entries = chatLog.ordered().filter((e) => e.kind === "chat" || e.kind === "file");
-  const rows = entries.map((entry) => {
-    const originNode = replicaNodeId(entry.origin);
-    const mine = originNode === myNodeId;
-    const time = new Date(entry.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    let inner: string;
-    if (entry.kind === "file") {
-      const meta = (entry.data ?? {}) as Partial<FileMeta>;
-      const cid = String(meta.cid ?? "");
-      const busy = downloading.has(cid);
-      inner = `<span class="file-chip" data-cid="${escapeHtml(cid)}">📄
-        <span class="fname">${escapeHtml(String(meta.name ?? "file"))}</span>
-        <span class="muted">${humanSize(Number(meta.size) || 0)}</span>
-        <button class="btn small file-dl" data-cid="${escapeHtml(cid)}" ${busy ? "disabled" : ""}>${busy ? "取得中" : "取得"}</button>
-      </span>`;
-    } else {
-      const data = entry.data as { text?: string };
-      inner = `<div class="bubble">${escapeHtml(String(data?.text ?? ""))}</div>`;
-    }
-    return `<div class="msg ${mine ? "me" : ""}">
-      ${avatarHtml(originNode)}
-      <div class="bubble-wrap">
-        <div class="who">${escapeHtml(nicknameOf(originNode))}</div>
-        ${inner}
-        <div class="time">${time}</div>
-      </div>
-    </div>`;
-  });
-  box.innerHTML = rows.join("") || `<div class="empty">まだメッセージはありません。<br>最初のひとことを送ってみましょう 👋</div>`;
-  for (const btn of box.querySelectorAll<HTMLButtonElement>(".file-dl")) {
-    btn.onclick = () => {
-      const cid = btn.dataset["cid"]!;
-      const entry = chatLog!.ordered().find((e) => e.kind === "file" && (e.data as FileMeta).cid === cid);
-      if (entry) void downloadFile(entry.data as FileMeta);
-    };
-  }
-  if (wasAtBottom || entries.length !== lastChatCount) box.scrollTop = box.scrollHeight;
-  lastChatCount = entries.length;
-}
-
-function renderNs(): void {
-  if (!nameService) return;
-  const rows = nameService
-    .all()
-    .filter((r) => !r.name.startsWith(REVOKED_PREFIX))
-    .map(
-      (r) =>
-        `<tr><td><code>${escapeHtml(r.name)}</code></td><td><code>${escapeHtml(JSON.stringify(r.value))}</code></td><td>${r.version}</td></tr>`,
-    );
-  $("ns-body").innerHTML = rows.join("") || `<tr><td colspan="3" class="muted">なし</td></tr>`;
-}
-
-function renderInvites(): void {
-  const list = $("issued-list");
-  if (!issuedInvites.length) {
-    list.innerHTML = "";
-    return;
-  }
-  list.innerHTML = issuedInvites
-    .map((inv) => {
-      const state = inv.revoked
-        ? `<span class="badge">失効</span>`
-        : `<button class="btn small danger revoke-btn" data-id="${escapeHtml(inv.invite_id)}">失効</button>`;
-      return `<li><code>${escapeHtml(inv.invite_id)}</code> <span class="muted small">${short(inv.subject_pubkey)}</span> ${state}</li>`;
-    })
-    .join("");
-  for (const btn of list.querySelectorAll<HTMLButtonElement>(".revoke-btn")) {
-    btn.onclick = () => {
-      if (confirm(`招待 ${btn.dataset["id"]} を失効させますか?`)) {
-        void revokeInvite(btn.dataset["id"]!).catch((e) => toast((e as Error).message, "error"));
-      }
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Room switching / sharing
-// ---------------------------------------------------------------------------
-
-function roomLink(room: string): string {
-  if (!location.protocol.startsWith("http")) return "";
-  return `${location.origin}${location.pathname}#room=${encodeURIComponent(room)}`;
-}
-
-async function switchRoom(room: string): Promise<void> {
-  const roomName = normalizeRoom(room);
-  if (!roomName) throw new Error("ルーム名を入力してください");
-  if (config?.open && config.room === roomName) return;
-  const relays = config?.relays ?? defaultRelays();
-  const nickname = config?.nickname ?? autoNickname();
-  // tear down current node, then join the new room
-  if (config) await leaveNetwork(true);
-  history.replaceState(null, "", `#room=${encodeURIComponent(roomName)}`);
-  await joinRoom(roomName, nickname, relays);
-}
-
-// ---------------------------------------------------------------------------
-// Boot + wiring
-// ---------------------------------------------------------------------------
-
-function autoNickname(): string {
-  return `guest-${randomHex(2)}`;
-}
-
-function urlRoom(): string | undefined {
-  const h = /[#&]room=([^&]+)/.exec(location.hash);
-  if (h) return decodeURIComponent(h[1]!);
-  const q = new URLSearchParams(location.search).get("room");
-  return q ?? undefined;
-}
-
-async function boot(): Promise<void> {
-  config = await store.get<NodeConfig>("kv", "config");
-
-  // invite link takes priority: prefill the welcome invite box
-  const inviteHash = /#invite=([A-Za-z0-9_-]+)/.exec(location.hash);
-
-  if (!config) {
-    // first run: show the welcome chooser, prefilled and one tap to join
-    const nick = $("welcome-nick") as HTMLInputElement;
-    const room = $("welcome-room") as HTMLInputElement;
-    if (!nick.value) nick.value = autoNickname();
-    if (!room.value) room.value = urlRoom() ?? "lobby";
-    if (inviteHash) {
-      ($("welcome-bundle") as HTMLTextAreaElement).value = inviteHash[1]!;
-      ($("welcome-advanced") as HTMLElement).hidden = false;
-      toast("招待リンクを検出。詳細設定から参加してください", "info");
-    }
-    $("welcome").hidden = false;
-    $("app").hidden = true;
-    return;
-  }
-
-  nodeStoredKeys = await store.get<StoredKeyPair>("kv", "nodeKeys");
-  if (!nodeStoredKeys) {
-    $("welcome").hidden = false;
-    return;
-  }
-  nodeKeys = await importKeyPair(nodeStoredKeys);
-  const storedGenesis = await store.get<StoredKeyPair>("kv", "genesisKeys");
-  genesisKeys = storedGenesis ? await importKeyPair(storedGenesis) : undefined;
-  inviteChain = (await store.get<InviteCertificate[]>("kv", "inviteChain")) ?? [];
-  issuedInvites = (await store.get<IssuedInvite[]>("kv", "issuedInvites")) ?? [];
-  await startNode();
-}
-
-function busyWrap(btn: HTMLButtonElement, fn: () => Promise<void>): void {
-  btn.onclick = async () => {
-    btn.disabled = true;
-    try {
-      await fn();
-    } catch (err) {
-      toast((err as Error).message, "error");
-      log(`error: ${(err as Error).message}`);
-    } finally {
-      btn.disabled = false;
-    }
-  };
-}
-
-function openDrawer(open: boolean): void {
-  $("drawer").hidden = !open;
-  $("drawer-scrim").hidden = !open;
-  if (open) renderAll();
-}
-
-function wireUi(): void {
-  // ---- welcome ----
-  busyWrap($("btn-welcome-join") as HTMLButtonElement, async () => {
-    const nick = ($("welcome-nick") as HTMLInputElement).value.trim() || autoNickname();
-    const room = ($("welcome-room") as HTMLInputElement).value.trim() || "lobby";
-    const relays = parseRelays(($("welcome-relays") as HTMLTextAreaElement).value);
-    history.replaceState(null, "", `#room=${encodeURIComponent(normalizeRoom(room))}`);
-    await joinRoom(room, nick, relays);
-  });
-
-  $("btn-welcome-advanced").onclick = () => {
-    const adv = $("welcome-advanced");
-    adv.hidden = !adv.hidden;
-  };
-
-  busyWrap($("btn-welcome-create") as HTMLButtonElement, async () => {
-    const nick = ($("welcome-nick") as HTMLInputElement).value.trim() || autoNickname();
-    const relays = parseRelays(($("welcome-relays") as HTMLTextAreaElement).value);
-    await createNetwork(nick, relays);
-  });
-
-  busyWrap($("btn-welcome-request") as HTMLButtonElement, async () => {
-    const code = await prepareJoinRequest();
-    const out = $("welcome-request-out") as HTMLTextAreaElement;
-    out.value = code;
-    out.hidden = false;
-    await copy(code, "参加コードをコピーしました");
-  });
-
-  busyWrap($("btn-welcome-acceptinvite") as HTMLButtonElement, async () => {
-    const bundle = ($("welcome-bundle") as HTMLTextAreaElement).value.trim();
-    const nick = ($("welcome-nick") as HTMLInputElement).value.trim() || autoNickname();
-    if (!bundle) throw new Error("招待コードを貼り付けてください");
-    await acceptInvite(bundle, nick);
-  });
-
-  busyWrap($("btn-welcome-import") as HTMLButtonElement, async () => {
-    const text = ($("welcome-import") as HTMLTextAreaElement).value.trim();
-    if (!text) throw new Error("JSON を貼り付けてください");
-    await importIdentity(text);
-  });
-
-  // ---- topbar / drawer ----
-  $("btn-menu").onclick = () => openDrawer(true);
-  $("btn-drawer-close").onclick = () => openDrawer(false);
-  $("drawer-scrim").onclick = () => openDrawer(false);
-  $("btn-share").onclick = () => void shareRoom();
-
-  // ---- composer ----
-  const chatInput = $("chat-input") as HTMLInputElement;
-  ($("composer") as HTMLFormElement).onsubmit = (ev) => {
-    ev.preventDefault();
-    const text = chatInput.value.trim();
-    if (!text) return;
-    chatInput.value = "";
-    void sendChat(text);
-  };
-  chatInput.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" && !ev.isComposing && ev.keyCode !== 229) {
-      ev.preventDefault();
-      ($("composer") as HTMLFormElement).requestSubmit();
-    }
-  });
-
-  const fileInput = $("file-input") as HTMLInputElement;
-  $("btn-file").onclick = () => fileInput.click();
-  fileInput.onchange = () => {
-    const file = fileInput.files?.[0];
-    fileInput.value = "";
-    if (file) void shareFile(file).catch((e) => toast((e as Error).message, "error"));
-  };
-
-  // ---- drawer: identity ----
-  busyWrap($("btn-save-nick") as HTMLButtonElement, async () => {
-    const nick = ($("d-nick") as HTMLInputElement).value.trim();
-    if (!nick) throw new Error("ニックネームを入力してください");
-    await setNickname(nick);
-    toast("ニックネームを更新しました", "ok");
-  });
-
-  // ---- drawer: rooms ----
-  busyWrap($("btn-join-room") as HTMLButtonElement, async () => {
-    const room = ($("d-room") as HTMLInputElement).value.trim();
-    await switchRoom(room);
-    ($("d-room") as HTMLInputElement).value = "";
-    openDrawer(false);
-  });
-  $("btn-copy-link").onclick = () => {
-    if (config?.open && config.room) void copy(roomLink(config.room), "共有リンクをコピーしました");
-    else void copy(anpUrl(config?.network_id ?? ""), "URLをコピーしました");
-  };
-  busyWrap($("btn-new-room") as HTMLButtonElement, async () => {
-    await switchRoom(`room-${randomHex(3)}`);
-    openDrawer(false);
-  });
-
-  // ---- drawer: NS ----
-  busyWrap($("btn-ns-publish") as HTMLButtonElement, async () => {
-    const name = ($("ns-name") as HTMLInputElement).value.trim();
-    const value = ($("ns-value") as HTMLInputElement).value.trim();
-    if (!name) return;
-    await publishRecord(name, value);
-    toast(`${name} を公開しました`, "ok");
-  });
-
-  // ---- drawer: invite ----
-  busyWrap($("btn-issue") as HTMLButtonElement, async () => {
-    const pubkey = ($("invite-pubkey") as HTMLInputElement).value.trim();
-    const grant = ($("invite-grant") as HTMLInputElement).checked;
-    const { bundle, link } = await issueInvite(pubkey, grant);
-    const out = $("invite-bundle") as HTMLTextAreaElement;
-    out.value = bundle;
-    out.hidden = false;
-    const row = $("invite-link-row");
-    row.hidden = !link;
-    if (link) ($("invite-link") as HTMLInputElement).value = link;
-    await copy(link || bundle, "招待をコピーしました");
-  });
-  $("btn-copy-invite-link").onclick = () => void copy(($("invite-link") as HTMLInputElement).value, "コピーしました");
-
-  // ---- drawer: relays ----
-  busyWrap($("btn-relay-add") as HTMLButtonElement, async () => {
-    const input = $("relay-add-url") as HTMLInputElement;
-    const url = input.value.trim();
-    if (!url) return;
-    await addRelayUrl(url);
-    input.value = "";
-  });
-
-  // ---- drawer: data ----
-  busyWrap($("btn-export") as HTMLButtonElement, () => exportIdentity());
-  $("btn-leave").onclick = () => void leaveNetwork().then(() => location.reload());
-  $("btn-reset").onclick = () => {
-    if (confirm("鍵・履歴をすべて削除します。よろしいですか?")) void resetIdentity();
-  };
-
-  window.addEventListener("pagehide", sendLeaveBeacon);
-  window.addEventListener("beforeunload", sendLeaveBeacon);
-}
-
-function parseRelays(text: string): string[] {
-  return text.split("\n").map((s) => s.trim()).filter(Boolean);
-}
-
-async function setNickname(nick: string): Promise<void> {
-  if (!config || !nodeKeys || !profileMap) return;
-  config.nickname = nick;
-  await store.put("kv", "config", config);
-  const key = `nickname/${myNodeId}`;
-  const cell = profileMap.set(key, nick);
-  await signCell(nodeKeys.privateKey, nodeKeys.publicKeyHex, key, cell);
-  await persistProfile();
-  mesh?.broadcast({ t: "PROFILE_DELTA", cells: { [key]: profileMap.getCell(key)! } });
-  void refreshJoin(true);
-  renderChat();
-  renderPeers();
-}
-
-async function shareRoom(): Promise<void> {
-  if (!config) return;
-  const link = config.open && config.room ? roomLink(config.room) : anpUrl(config.network_id);
-  const shareData = { title: "ANP", text: `ANPルーム #${config.room ?? ""} に参加しよう`, url: link || undefined };
-  if (navigator.share && link) {
-    try {
-      await navigator.share(shareData);
-      return;
-    } catch {
-      /* fall through to copy */
-    }
-  }
-  await copy(link || anpUrl(config.network_id), "共有リンクをコピーしました");
-}
-
 async function copy(text: string, okMsg: string): Promise<void> {
   if (!text) return;
   try {
@@ -1757,15 +103,548 @@ async function copy(text: string, okMsg: string): Promise<void> {
     toast("コピーできませんでした", "error");
   }
 }
-
-/** Fatal, user-visible startup failure (never a silent blank page). */
-function fatal(message: string): void {
-  document.body.innerHTML = `<div class="overlay"><div class="welcome-card"><h2>起動できません</h2><p class="muted">${escapeHtml(
-    message,
-  )}</p></div></div>`;
+function defaultRelays(): string[] {
+  if (location.protocol.startsWith("http")) {
+    return [`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`];
+  }
+  return [];
+}
+function autoNickname(): string {
+  const buf = new Uint8Array(2);
+  crypto.getRandomValues(buf);
+  return `guest-${[...buf].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
-/** One active tab per profile: two tabs would corrupt the shared CRDT. */
+// ---------------------------------------------------------------------------
+// Conversation management
+// ---------------------------------------------------------------------------
+
+function deps() {
+  return {
+    store,
+    reputation,
+    nickname: () => nickname,
+    onChange: (c: Conversation) => {
+      if (c.networkId === activeId) void renderChat();
+      renderConvList();
+    },
+    onActivity: (c: Conversation) => {
+      if (c.networkId !== activeId) renderConvList();
+    },
+    log,
+  };
+}
+
+async function persistConversations(): Promise<void> {
+  const list: ConvPersist[] = [...conversations.values()]
+    .filter((c) => c.kind !== "invite")
+    .map((c) => ({
+      network_id: c.networkId,
+      kind: c.kind as "channel" | "dm",
+      room: c.spec.room ?? "",
+      title: c.spec.title,
+      peerPubkey: c.spec.peerPubkey,
+    }));
+  await store.put("kv", "conversations", list);
+}
+
+async function addConversation(spec: ConvSpec, activate = true): Promise<Conversation> {
+  let conv = conversations.get(spec.network_id);
+  if (!conv) {
+    conv = new Conversation(spec, identity!, deps());
+    conversations.set(spec.network_id, conv);
+    await conv.start();
+    await persistConversations();
+  }
+  if (activate) setActive(spec.network_id);
+  renderConvList();
+  return conv;
+}
+
+async function openChannel(name: string): Promise<void> {
+  const room = normalizeRoom(name);
+  if (!room) throw new Error("チャンネル名を入力してください");
+  const networkId = await openNetworkId(room);
+  await addConversation({ network_id: networkId, kind: "channel", room, title: `#${room}`, relays });
+}
+
+async function openDm(peerPubkey: string): Promise<void> {
+  const pk = peerPubkey.trim().toLowerCase();
+  if (!/^[0-9a-f]{130}$/.test(pk)) throw new Error("ユーザーIDの形式が正しくありません");
+  if (pk === identity!.pubkeyHex) throw new Error("自分自身とはDMできません");
+  const networkId = await dmNetworkId(identity!.pubkeyHex, pk);
+  const room = dmRoom(identity!.pubkeyHex, pk);
+  await addConversation({
+    network_id: networkId,
+    kind: "dm",
+    room,
+    title: `@${short(pk)}`,
+    relays,
+    peerPubkey: pk,
+  });
+}
+
+function setActive(networkId: string): void {
+  activeId = networkId;
+  conversations.get(networkId)?.clearUnread();
+  document.body.classList.add("chat-open");
+  $("chat").classList.remove("empty-state");
+  $("chat-empty").hidden = true;
+  $("chat-view").hidden = false;
+  void renderChat();
+  renderConvList();
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function renderConvList(): void {
+  const list = $("conv-list");
+  const items = [...conversations.values()].sort((a, b) => b.lastTs - a.lastTs);
+  list.innerHTML =
+    items
+      .map((c) => {
+        const active = c.networkId === activeId;
+        const unread = c.unread > 0 ? `<span class="unread">${c.unread}</span>` : "";
+        const sub = c.connectedCount() > 0 ? `${c.connectedCount()}人接続中` : "探索中…";
+        return `<button class="conv-item ${active ? "active" : ""}" data-id="${c.networkId}">
+          ${avatarHtml(c.networkId, c.displayTitle().replace(/^[#@]/, ""))}
+          <div class="conv-main"><div class="conv-title">${escapeHtml(c.displayTitle())}</div><div class="conv-sub">${sub}</div></div>
+          ${unread}
+        </button>`;
+      })
+      .join("") || `<div class="muted small" style="padding:16px">会話がありません</div>`;
+  for (const btn of list.querySelectorAll<HTMLButtonElement>(".conv-item")) {
+    btn.onclick = () => setActive(btn.dataset["id"]!);
+  }
+  // profile chip
+  $("me-name").textContent = nickname;
+  ($("me-avatar") as HTMLElement).style.background = avatarColor(identity?.myNodeId ?? "");
+  $("me-avatar").textContent = initial(nickname);
+}
+
+async function renderChat(): Promise<void> {
+  if (!activeId) return;
+  const conv = conversations.get(activeId);
+  if (!conv) return;
+  $("room-title").textContent = conv.displayTitle();
+  const dot = $("conn-dot");
+  const ctext = $("conn-text");
+  dot.className = "dot";
+  const connected = conv.connectedCount();
+  if (connected > 0) {
+    dot.classList.add("ok");
+    ctext.textContent = conv.kind === "dm" ? "接続中・暗号化" : `${connected}人と接続中`;
+  } else if (conv.relaysUp() > 0) {
+    dot.classList.add("warn");
+    ctext.textContent = "相手を探索中…";
+  } else if (!conv.hasRelays()) {
+    dot.classList.add("ng");
+    ctext.textContent = "Relay未設定";
+  } else {
+    dot.classList.add("ng");
+    ctext.textContent = "Relayに接続中…";
+  }
+
+  const box = $("chat-box");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 60;
+  const msgs = await conv.messages();
+  box.innerHTML =
+    msgs
+      .map((m) => {
+        const time = new Date(m.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const who = conv.nicknameOf(m.origin);
+        let inner: string;
+        if (m.kind === "file" && m.file) {
+          const busy = downloading.has(m.file.cid);
+          inner = `<span class="file-chip" data-cid="${escapeHtml(m.file.cid)}">📄
+            <span class="fname">${escapeHtml(m.file.name)}</span>
+            <span class="muted">${humanSize(m.file.size)}</span>
+            <button class="btn small file-dl" data-cid="${escapeHtml(m.file.cid)}" ${busy ? "disabled" : ""}>${busy ? "取得中" : "取得"}</button></span>`;
+        } else {
+          inner = `<div class="bubble">${escapeHtml(m.text ?? "")}</div>`;
+        }
+        return `<div class="msg ${m.mine ? "me" : ""}">${avatarHtml(m.origin, who)}
+          <div class="bubble-wrap"><div class="who">${escapeHtml(who)}</div>${inner}<div class="time">${time}</div></div></div>`;
+      })
+      .join("") ||
+    `<div class="empty">${
+      conv.kind === "dm" ? "暗号化されたDMです。最初のメッセージを送りましょう 🔒" : "まだメッセージはありません 👋"
+    }</div>`;
+  for (const b of box.querySelectorAll<HTMLButtonElement>(".file-dl")) {
+    b.onclick = () => {
+      const cid = b.dataset["cid"]!;
+      const m = msgs.find((x) => x.file?.cid === cid);
+      if (m?.file) void downloadFile(conv, m.file);
+    };
+  }
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function renderMembers(): void {
+  const conv = activeId ? conversations.get(activeId) : undefined;
+  const sec = $("members-sec");
+  if (!conv || conv.kind === "dm") {
+    sec.hidden = true;
+    return;
+  }
+  sec.hidden = false;
+  const members = conv.memberViews();
+  $("peer-count").textContent = String(members.filter((m) => m.connected).length);
+  $("member-list").innerHTML =
+    members
+      .map((m) => {
+        const state = m.connected ? "接続中" : m.seen ? "発見済み" : "オフライン";
+        const trust = m.banned ? `<span class="badge ng-text">遮断</span>` : m.score !== 0 ? `<span class="badge">信頼 ${m.score}</span>` : "";
+        return `<li>${avatarHtml(m.node_id, m.nickname)}
+          <div class="m-main"><div class="m-name">${escapeHtml(m.nickname)}</div><div class="m-sub">${state} ${trust}</div></div>
+          <button class="btn small dm-btn" data-pk="${escapeHtml(m.pubkey)}">DM</button></li>`;
+      })
+      .join("") || `<li class="muted">まだ他の参加者がいません</li>`;
+  for (const b of $("member-list").querySelectorAll<HTMLButtonElement>(".dm-btn")) {
+    b.onclick = () => {
+      openDrawer(false);
+      void openDm(b.dataset["pk"]!).catch((e) => toast((e as Error).message, "error"));
+    };
+  }
+}
+
+const downloading = new Set<string>();
+async function downloadFile(conv: Conversation, meta: FileMeta): Promise<void> {
+  if (downloading.has(meta.cid)) return;
+  downloading.add(meta.cid);
+  void renderChat();
+  try {
+    const bytes = await conv.fetchBlob(meta);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([bytes as BlobPart], { type: meta.mime || "application/octet-stream" }));
+    a.download = meta.name || "file";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast(`${meta.name} を取得しました（CID検証済み）`, "ok");
+  } catch (e) {
+    toast(`取得失敗: ${(e as Error).message}`, "error");
+  } finally {
+    downloading.delete(meta.cid);
+    void renderChat();
+  }
+}
+
+function renderRelays(): void {
+  const list = $("relay-list");
+  list.innerHTML =
+    relays
+      .map(
+        (url) =>
+          `<li><span style="flex:1;word-break:break-all">${escapeHtml(url)}</span><button class="btn small relay-rm" data-url="${escapeHtml(url)}">削除</button></li>`,
+      )
+      .join("") || `<li class="muted">未設定（探索できません）</li>`;
+  for (const b of list.querySelectorAll<HTMLButtonElement>(".relay-rm")) {
+    b.onclick = () => void removeRelay(b.dataset["url"]!);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Relays (shared across conversations; changing requires rejoin)
+// ---------------------------------------------------------------------------
+
+async function addRelay(url: string): Promise<void> {
+  if (!/^wss?:\/\//.test(url)) throw new Error("ws:// または wss:// で始めてください");
+  if (relays.includes(url)) throw new Error("追加済みです");
+  relays = [...relays, url];
+  await store.put("kv", "relays", relays);
+  renderRelays();
+  await rejoinAll();
+  toast("Relayを追加しました。再接続します", "ok");
+}
+async function removeRelay(url: string): Promise<void> {
+  relays = relays.filter((r) => r !== url);
+  await store.put("kv", "relays", relays);
+  renderRelays();
+  await rejoinAll();
+  toast("Relayを削除しました", "info");
+}
+async function rejoinAll(): Promise<void> {
+  const specs = [...conversations.values()].map((c) => ({ ...c.spec, relays }));
+  for (const c of conversations.values()) await c.stop();
+  conversations.clear();
+  for (const spec of specs) await addConversation(spec, false);
+  if (activeId) setActive(activeId);
+}
+
+// ---------------------------------------------------------------------------
+// Identity / boot
+// ---------------------------------------------------------------------------
+
+async function buildIdentity(stored: StoredKeyPair): Promise<Identity> {
+  const nodeKeys = await importKeyPair(stored);
+  const ecdhKey = await importPrivateKeyForEcdh(stored.privateJwk);
+  const myNodeId = await nodeIdFromPubkey(stored.publicKeyHex);
+  return { nodeKeys, ecdhKey, myNodeId, pubkeyHex: stored.publicKeyHex };
+}
+
+async function firstRun(nick: string, relayUrl: string): Promise<void> {
+  const keys = await exportKeyPair(await generateKeyPair());
+  await store.put("kv", "identityKeys", keys);
+  nickname = nick;
+  await store.put("kv", "nickname", nickname);
+  relays = relayUrl ? [relayUrl] : defaultRelays();
+  await store.put("kv", "relays", relays);
+  await boot();
+}
+
+async function boot(): Promise<void> {
+  const stored = await store.get<StoredKeyPair>("kv", "identityKeys");
+  if (!stored) {
+    ($("welcome-nick") as HTMLInputElement).value ||= autoNickname();
+    $("welcome-relay-field").hidden = location.protocol.startsWith("http");
+    $("welcome").hidden = false;
+    $("layout").hidden = true;
+    return;
+  }
+  identity = await buildIdentity(stored);
+  reputation = Reputation.fromJSON(await store.all<PeerScore>("peers"));
+  reputation.onChange = (r) => void store.put("peers", r.node_id, r);
+  nickname = (await store.get<string>("kv", "nickname")) ?? autoNickname();
+  relays = (await store.get<string[]>("kv", "relays")) ?? defaultRelays();
+
+  $("welcome").hidden = true;
+  $("layout").hidden = false;
+  ($("d-nick") as HTMLInputElement).value = nickname;
+  ($("my-id") as HTMLInputElement).value = identity.pubkeyHex;
+  ($("d-my-id") as HTMLInputElement).value = identity.pubkeyHex;
+  renderRelays();
+
+  // restore conversations, then ensure #general exists
+  const saved = (await store.get<ConvPersist[]>("kv", "conversations")) ?? [];
+  for (const s of saved) {
+    await addConversation({ network_id: s.network_id, kind: s.kind, room: s.room, title: s.title, relays, peerPubkey: s.peerPubkey }, false);
+  }
+  if (![...conversations.values()].some((c) => c.kind === "channel")) {
+    await openChannel("general");
+  } else {
+    renderConvList();
+  }
+  if (relays.length === 0) {
+    toast("Relayが未設定です。設定から追加すると相手を探索できます。", "info");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Modals / drawer
+// ---------------------------------------------------------------------------
+
+function openModal(id: string): void {
+  $("modal-scrim").hidden = false;
+  $(id).hidden = false;
+}
+function closeModals(): void {
+  $("modal-scrim").hidden = true;
+  for (const m of ["modal-channel", "modal-dm"]) $(m).hidden = true;
+}
+function openDrawer(open: boolean): void {
+  $("drawer").hidden = !open;
+  $("drawer-scrim").hidden = !open;
+  if (open) {
+    renderMembers();
+    renderRelays();
+  }
+}
+
+function busy(btn: HTMLButtonElement, fn: () => Promise<void>): void {
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      await fn();
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Data actions
+// ---------------------------------------------------------------------------
+
+async function setNickname(nick: string): Promise<void> {
+  nickname = nick;
+  await store.put("kv", "nickname", nickname);
+  renderConvList();
+  void renderChat();
+  toast("表示名を更新しました", "ok");
+}
+
+async function exportIdentity(): Promise<void> {
+  const keys = await store.get<StoredKeyPair>("kv", "identityKeys");
+  const payload = {
+    v: 1,
+    nickname,
+    relays,
+    keys,
+    conversations: (await store.get<ConvPersist[]>("kv", "conversations")) ?? [],
+  };
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+  a.download = "anp-backup.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast("バックアップを保存しました（秘密鍵を含みます）", "info");
+}
+
+async function importIdentity(text: string): Promise<void> {
+  const p = JSON.parse(text) as { v: number; nickname?: string; relays?: string[]; keys?: StoredKeyPair; conversations?: ConvPersist[] };
+  if (p.v !== 1 || !p.keys?.privateJwk) throw new Error("バックアップの形式が不正です");
+  await store.put("kv", "identityKeys", p.keys);
+  await store.put("kv", "nickname", p.nickname ?? autoNickname());
+  await store.put("kv", "relays", p.relays ?? defaultRelays());
+  await store.put("kv", "conversations", p.conversations ?? []);
+  location.reload();
+}
+
+async function resetAll(): Promise<void> {
+  for (const c of conversations.values()) await c.stop();
+  await store.clearAll();
+  location.reload();
+}
+
+async function shareActive(): Promise<void> {
+  const conv = activeId ? conversations.get(activeId) : undefined;
+  if (!conv) return;
+  if (conv.kind === "dm") {
+    await copy(identity!.pubkeyHex, "あなたのIDをコピーしました（相手に渡してDMできます）");
+    return;
+  }
+  const link = location.protocol.startsWith("http")
+    ? `${location.origin}${location.pathname}#channel=${encodeURIComponent(conv.spec.room ?? "")}`
+    : "";
+  if (navigator.share && link) {
+    try {
+      await navigator.share({ title: "ANP Chat", text: `${conv.title} に参加しよう`, url: link });
+      return;
+    } catch {
+      /* fall through */
+    }
+  }
+  await copy(link || conv.title, "共有リンクをコピーしました");
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+function wireUi(): void {
+  // welcome
+  busy($("btn-welcome-start") as HTMLButtonElement, async () => {
+    const nick = ($("welcome-nick") as HTMLInputElement).value.trim() || autoNickname();
+    const relay = ($("welcome-relay") as HTMLInputElement).value.trim();
+    await firstRun(nick, relay);
+  });
+  $("btn-welcome-import-toggle").onclick = () => {
+    const box = $("welcome-import-box");
+    box.hidden = !box.hidden;
+  };
+  busy($("btn-welcome-import") as HTMLButtonElement, async () => {
+    const text = ($("welcome-import") as HTMLTextAreaElement).value.trim();
+    if (!text) throw new Error("JSONを貼り付けてください");
+    await importIdentity(text);
+  });
+
+  // sidebar actions
+  $("btn-new-channel").onclick = () => {
+    ($("channel-name") as HTMLInputElement).value = "";
+    openModal("modal-channel");
+  };
+  $("btn-new-dm").onclick = () => {
+    ($("my-id") as HTMLInputElement).value = identity?.pubkeyHex ?? "";
+    ($("dm-peer-id") as HTMLInputElement).value = "";
+    openModal("modal-dm");
+  };
+  $("btn-settings").onclick = () => openDrawer(true);
+
+  // modals
+  $("modal-scrim").onclick = closeModals;
+  for (const b of document.querySelectorAll<HTMLButtonElement>(".modal-cancel")) b.onclick = closeModals;
+  busy($("btn-channel-join") as HTMLButtonElement, async () => {
+    await openChannel(($("channel-name") as HTMLInputElement).value);
+    closeModals();
+  });
+  $("btn-copy-id").onclick = () => void copy(identity?.pubkeyHex ?? "", "IDをコピーしました");
+  busy($("btn-dm-start") as HTMLButtonElement, async () => {
+    await openDm(($("dm-peer-id") as HTMLInputElement).value);
+    closeModals();
+  });
+
+  // chat
+  $("btn-back").onclick = () => {
+    document.body.classList.remove("chat-open");
+  };
+  $("conv-title").onclick = () => openDrawer(true);
+  $("btn-share").onclick = () => void shareActive();
+  const input = $("chat-input") as HTMLInputElement;
+  ($("composer") as HTMLFormElement).onsubmit = (ev) => {
+    ev.preventDefault();
+    const text = input.value.trim();
+    if (!text || !activeId) return;
+    input.value = "";
+    void conversations.get(activeId)?.sendChat(text).catch((e) => toast((e as Error).message, "error"));
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.isComposing && ev.keyCode !== 229) {
+      ev.preventDefault();
+      ($("composer") as HTMLFormElement).requestSubmit();
+    }
+  });
+  const fileInput = $("file-input") as HTMLInputElement;
+  $("btn-file").onclick = () => fileInput.click();
+  fileInput.onchange = () => {
+    const file = fileInput.files?.[0];
+    fileInput.value = "";
+    if (file && activeId) void conversations.get(activeId)?.shareFile(file).catch((e) => toast((e as Error).message, "error"));
+  };
+
+  // drawer
+  $("btn-drawer-close").onclick = () => openDrawer(false);
+  $("drawer-scrim").onclick = () => openDrawer(false);
+  busy($("btn-save-nick") as HTMLButtonElement, async () => {
+    const nick = ($("d-nick") as HTMLInputElement).value.trim();
+    if (!nick) throw new Error("表示名を入力してください");
+    await setNickname(nick);
+  });
+  $("btn-copy-id2").onclick = () => void copy(identity?.pubkeyHex ?? "", "IDをコピーしました");
+  busy($("btn-relay-add") as HTMLButtonElement, async () => {
+    const el = $("relay-add-url") as HTMLInputElement;
+    if (!el.value.trim()) return;
+    await addRelay(el.value.trim());
+    el.value = "";
+  });
+  busy($("btn-export") as HTMLButtonElement, () => exportIdentity());
+  $("btn-reset").onclick = () => {
+    if (confirm("すべての鍵・会話・履歴を削除します。よろしいですか?")) void resetAll();
+  };
+
+  // channel link in URL
+  window.addEventListener("hashchange", () => void handleChannelHash());
+}
+
+async function handleChannelHash(): Promise<void> {
+  const m = /[#&]channel=([^&]+)/.exec(location.hash);
+  if (m && identity) {
+    await openChannel(decodeURIComponent(m[1]!));
+    history.replaceState(null, "", location.pathname);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+function fatal(msg: string): void {
+  document.body.innerHTML = `<div class="overlay"><div class="welcome-card"><h2>起動できません</h2><p class="muted">${escapeHtml(msg)}</p></div></div>`;
+}
+
 function acquireSingleTabLock(): Promise<boolean> {
   if (!("locks" in navigator)) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -1778,20 +657,19 @@ function acquireSingleTabLock(): Promise<boolean> {
 
 void (async () => {
   if (!globalThis.crypto?.subtle) {
-    fatal("このブラウザは Web Crypto に対応していません。最新のブラウザで開いてください。");
+    fatal("このブラウザは Web Crypto に対応していません。");
     return;
   }
   if (!(await acquireSingleTabLock())) {
-    fatal("別のタブで ANP が起動中です。このタブは同時実行を避けるため停止しました。");
+    fatal("別のタブで ANP Chat が起動中です。データ保護のためこのタブは停止しました。");
     return;
   }
   try {
     store = await AnpStore.open();
     wireUi();
     await boot();
-    if (store.ephemeral) {
-      toast("この環境では履歴が保存されません（リロードで消えます）。", "info");
-    }
+    await handleChannelHash();
+    if (store.ephemeral) toast("この環境では履歴が保存されません（リロードで消えます）。", "info");
   } catch (err) {
     fatal(`初期化に失敗しました: ${(err as Error).message}`);
   }

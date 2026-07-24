@@ -4,172 +4,148 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
   <meta name="theme-color" content="#6d5efc" />
-  <title>ANP</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🛰️%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/styles.css" />
+  <title>ANP Chat</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E💬%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div id="toasts"></div>
 
-  <!-- ==================== Welcome / room chooser ==================== -->
+  <!-- ==================== First-run ==================== -->
   <section id="welcome" class="overlay" hidden>
     <div class="welcome-card">
-      <div class="logo">🛰️ <span>ANP</span></div>
-      <p class="lede">分散型チャット。ルーム名を入れて参加するだけ。<br />サーバーを介さず、参加者のブラウザ同士が直接つながります。</p>
-
+      <div class="logo">💬 <span>ANP Chat</span></div>
+      <p class="lede">分散型チャット。サーバーに保存されず、参加者のブラウザ同士が直接つながります。名前だけ決めて始めましょう。</p>
       <label class="field">
-        <span>ニックネーム</span>
+        <span>表示名</span>
         <input id="welcome-nick" maxlength="24" autocomplete="off" />
       </label>
-      <label class="field">
-        <span>ルーム</span>
-        <input id="welcome-room" maxlength="64" autocomplete="off" placeholder="lobby" />
+      <label class="field" id="welcome-relay-field" hidden>
+        <span>Relayサーバー（自動探索に使用）</span>
+        <input id="welcome-relay" placeholder="wss://example.com" autocomplete="off" />
       </label>
-      <button id="btn-welcome-join" class="btn primary big">参加する</button>
-
-      <button id="btn-welcome-advanced" class="linklike">詳細設定・招待制ネットワーク ▾</button>
-      <div id="welcome-advanced" hidden>
-        <label class="field">
-          <span>Relay（1行に1つ・空欄で自動）</span>
-          <textarea id="welcome-relays" rows="2" placeholder="wss://example.com"></textarea>
-        </label>
-        <div class="adv-block">
-          <h4>招待制ネットワークを作成</h4>
-          <p class="muted small">承認した相手だけが参加できる非公開ネットワークを作ります。</p>
-          <button id="btn-welcome-create" class="btn">作成する</button>
-        </div>
-        <div class="adv-block">
-          <h4>招待を受けて参加</h4>
-          <button id="btn-welcome-request" class="btn small">① 参加コードを作成</button>
-          <textarea id="welcome-request-out" rows="2" readonly hidden></textarea>
-          <textarea id="welcome-bundle" rows="2" placeholder="② 受け取った招待コードを貼り付け"></textarea>
-          <button id="btn-welcome-acceptinvite" class="btn">③ 参加</button>
-        </div>
-        <div class="adv-block">
-          <h4>identity を復元</h4>
-          <textarea id="welcome-import" rows="2" placeholder="エクスポートした JSON"></textarea>
-          <button id="btn-welcome-import" class="btn small">インポート</button>
-        </div>
+      <button id="btn-welcome-start" class="btn primary big">はじめる</button>
+      <button id="btn-welcome-import-toggle" class="linklike">バックアップから復元</button>
+      <div id="welcome-import-box" hidden>
+        <textarea id="welcome-import" rows="2" placeholder="エクスポートした JSON"></textarea>
+        <button id="btn-welcome-import" class="btn small">インポート</button>
       </div>
     </div>
   </section>
 
-  <!-- ==================== Main chat ==================== -->
-  <div id="app" hidden>
-    <header id="topbar">
-      <button id="btn-menu" class="icon-btn" aria-label="メニュー">
-        <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
-      </button>
-      <div class="room-info">
-        <div id="room-title">#lobby</div>
-        <div id="conn-status"><span id="conn-dot" class="dot"></span><span id="conn-text">接続中…</span></div>
+  <!-- ==================== Main (sidebar + chat) ==================== -->
+  <div id="layout" hidden>
+    <!-- Conversation list -->
+    <aside id="sidebar">
+      <header class="side-head">
+        <div class="me" id="me-chip">
+          <span class="avatar" id="me-avatar"></span>
+          <div class="me-main"><div id="me-name"></div><div class="me-sub" id="me-status">オンライン</div></div>
+        </div>
+        <button id="btn-settings" class="icon-btn" aria-label="設定">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.7-1L14.5 3h-5l-.3 2.5a7 7 0 0 0-1.7 1l-2.4-1-2 3.5L3 11a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.7 1L9.5 21h5l.3-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1z"/></svg>
+        </button>
+      </header>
+      <div id="conv-list" class="conv-list"></div>
+      <div class="side-actions">
+        <button id="btn-new-channel" class="btn small">＃ チャンネル</button>
+        <button id="btn-new-dm" class="btn small">✉ DM</button>
       </div>
-      <button id="btn-share" class="icon-btn" aria-label="共有">
-        <svg viewBox="0 0 24 24"><path d="M4 12v8h16v-8M12 3v13M8 7l4-4 4 4"/></svg>
-      </button>
-    </header>
+    </aside>
 
-    <main id="chat-box"></main>
-
-    <form id="composer" autocomplete="off">
-      <button type="button" id="btn-file" class="icon-btn" aria-label="ファイル">
-        <svg viewBox="0 0 24 24"><path d="M21 15V6a3 3 0 0 0-6 0v11a5 5 0 0 1-10 0V7"/></svg>
-      </button>
-      <input id="chat-input" placeholder="メッセージを入力…" />
-      <button type="submit" id="btn-send" class="icon-btn send" aria-label="送信">
-        <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6-7-2z"/></svg>
-      </button>
-      <input type="file" id="file-input" hidden />
-    </form>
+    <!-- Active chat -->
+    <main id="chat" class="empty-state">
+      <div id="chat-empty" class="chat-empty">
+        <div>💬</div>
+        <p>会話を選ぶか、チャンネル／DMを始めましょう</p>
+      </div>
+      <div id="chat-view" hidden>
+        <header id="topbar">
+          <button id="btn-back" class="icon-btn only-mobile" aria-label="戻る">
+            <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+          <button id="conv-title" class="conv-title-btn">
+            <div id="room-title">#general</div>
+            <div id="conn-status"><span id="conn-dot" class="dot"></span><span id="conn-text">…</span></div>
+          </button>
+          <button id="btn-share" class="icon-btn" aria-label="共有">
+            <svg viewBox="0 0 24 24"><path d="M4 12v8h16v-8M12 3v13M8 7l4-4 4 4"/></svg>
+          </button>
+        </header>
+        <div id="chat-box"></div>
+        <form id="composer" autocomplete="off">
+          <button type="button" id="btn-file" class="icon-btn" aria-label="ファイル">
+            <svg viewBox="0 0 24 24"><path d="M21 15V6a3 3 0 0 0-6 0v11a5 5 0 0 1-10 0V7"/></svg>
+          </button>
+          <input id="chat-input" placeholder="メッセージを入力…" />
+          <button type="submit" id="btn-send" class="icon-btn send" aria-label="送信">
+            <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6-7-2z"/></svg>
+          </button>
+          <input type="file" id="file-input" hidden />
+        </form>
+      </div>
+    </main>
   </div>
 
-  <!-- ==================== Drawer ==================== -->
+  <!-- ==================== Modals ==================== -->
+  <div id="modal-scrim" class="scrim" hidden></div>
+
+  <div id="modal-channel" class="modal" hidden>
+    <h3>チャンネルに参加 / 作成</h3>
+    <p class="muted small">チャンネル名を入れると、同じ名前の人と自動でつながります。存在しなければ新規作成。</p>
+    <input id="channel-name" placeholder="例: general, tokyo, game" />
+    <div class="modal-actions">
+      <button class="btn modal-cancel">キャンセル</button>
+      <button id="btn-channel-join" class="btn primary">参加</button>
+    </div>
+  </div>
+
+  <div id="modal-dm" class="modal" hidden>
+    <h3>ダイレクトメッセージ</h3>
+    <p class="muted small">相手の「ユーザーID」を貼り付けて1対1で会話します。内容は2人だけが復号できるよう暗号化されます。</p>
+    <label class="field"><span>あなたのID（相手に渡す）</span>
+      <div class="row gap"><input id="my-id" readonly /><button id="btn-copy-id" class="btn small">コピー</button></div>
+    </label>
+    <label class="field"><span>相手のID</span><input id="dm-peer-id" placeholder="04..." /></label>
+    <div class="modal-actions">
+      <button class="btn modal-cancel">キャンセル</button>
+      <button id="btn-dm-start" class="btn primary">開始</button>
+    </div>
+  </div>
+
+  <!-- Settings / members drawer -->
   <div id="drawer-scrim" hidden></div>
   <aside id="drawer" hidden>
-    <div class="drawer-head">
-      <b>設定</b>
-      <button id="btn-drawer-close" class="icon-btn" aria-label="閉じる">
-        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
-      </button>
+    <div class="drawer-head"><b id="drawer-title">設定</b>
+      <button id="btn-drawer-close" class="icon-btn" aria-label="閉じる"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     </div>
-
     <div class="drawer-body">
-      <section class="d-sec">
-        <h3>あなた</h3>
-        <label class="field row">
-          <input id="d-nick" maxlength="24" />
-          <button id="btn-save-nick" class="btn small">保存</button>
-        </label>
-        <div class="kv"><span>ID</span><code id="d-node-id"></code></div>
-        <div class="kv"><span>種類</span><span id="d-role"></span></div>
-      </section>
-
-      <section class="d-sec">
-        <h3>参加者 <span id="peer-count" class="chip">0</span></h3>
+      <section class="d-sec" id="members-sec" hidden>
+        <h3>この会話の参加者 <span id="peer-count" class="chip">0</span></h3>
         <ul id="member-list" class="members"></ul>
       </section>
-
       <section class="d-sec">
-        <h3>ルーム</h3>
-        <div class="kv"><span>URL</span><code id="d-net-url" class="wrap"></code></div>
-        <label class="field row">
-          <input id="d-room" placeholder="別のルーム名" />
-          <button id="btn-join-room" class="btn small">移動</button>
+        <h3>プロフィール</h3>
+        <label class="field row"><input id="d-nick" maxlength="24" /><button id="btn-save-nick" class="btn small">保存</button></label>
+        <label class="field"><span>あなたのID</span>
+          <div class="row gap"><input id="d-my-id" readonly /><button id="btn-copy-id2" class="btn small">コピー</button></div>
         </label>
-        <div class="row gap">
-          <button id="btn-copy-link" class="btn small">共有リンクをコピー</button>
-          <button id="btn-new-room" class="btn small">新規ルーム</button>
-        </div>
       </section>
-
-      <details class="d-sec">
-        <summary>Name Service</summary>
-        <div class="table-wrap">
-          <table><thead><tr><th>name</th><th>value</th><th>ver</th></tr></thead>
-            <tbody id="ns-body"></tbody></table>
-        </div>
-        <label class="field"><input id="ns-name" placeholder="service/chat" /></label>
-        <label class="field row">
-          <input id="ns-value" placeholder='{"nodes":["..."]}' />
-          <button id="btn-ns-publish" class="btn small">公開</button>
-        </label>
-      </details>
-
-      <details class="d-sec" id="invite-card" hidden>
-        <summary>招待を発行（招待制ネットワーク）</summary>
-        <p class="muted small">相手の参加コードを貼り付けて招待コード／リンクを発行します。</p>
-        <label class="field"><input id="invite-pubkey" placeholder="相手の 04... コード" /></label>
-        <label class="check"><input type="checkbox" id="invite-grant" /> 招待権も付与</label>
-        <button id="btn-issue" class="btn">発行</button>
-        <textarea id="invite-bundle" rows="2" readonly hidden></textarea>
-        <div class="row gap" id="invite-link-row" hidden>
-          <input id="invite-link" readonly />
-          <button id="btn-copy-invite-link" class="btn small">コピー</button>
-        </div>
-        <ul id="issued-list" class="plain"></ul>
-      </details>
-
       <details class="d-sec">
         <summary>Relay</summary>
+        <p class="muted small">オープンチャンネル/DMの相手探索に使うサーバー。全会話で共有。</p>
         <ul id="relay-list" class="plain"></ul>
-        <label class="field row">
-          <input id="relay-add-url" placeholder="wss://..." />
-          <button id="btn-relay-add" class="btn small">追加</button>
-        </label>
+        <label class="field row"><input id="relay-add-url" placeholder="wss://..." /><button id="btn-relay-add" class="btn small">追加</button></label>
       </details>
-
       <details class="d-sec">
-        <summary>詳細・データ</summary>
-        <button id="btn-export" class="btn small">identity をエクスポート</button>
-        <div class="row gap">
-          <button id="btn-leave" class="btn small">切断</button>
-          <button id="btn-reset" class="btn small danger">全削除</button>
-        </div>
+        <summary>データ・バックアップ</summary>
+        <button id="btn-export" class="btn small">バックアップをエクスポート</button>
+        <button id="btn-reset" class="btn small danger">すべて削除</button>
         <pre id="log"></pre>
       </details>
     </div>
   </aside>
 
-  <script type="module" src="/anp.js"></script>
+  <script type="module" src="anp.js"></script>
 </body>
 </html>

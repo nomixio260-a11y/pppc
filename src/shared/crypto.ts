@@ -240,6 +240,38 @@ export async function importPrivateKeyForEcdh(privateJwk: JsonWebKey): Promise<C
   return subtle.importKey("jwk", jwk, ECDH_PARAMS, false, ["deriveBits"]);
 }
 
+/**
+ * Derive the symmetric key for a DM between us and `peerPubkeyHex`. ECDH is
+ * symmetric, so both parties compute the same key from (their private, other's
+ * public). Bound to the sorted pubkey pair via the HKDF salt so the key is
+ * unique per conversation.
+ */
+export async function deriveDmKey(myEcdhPrivateKey: CryptoKey, peerPubkeyHex: string, myPubkeyHex: string): Promise<CryptoKey> {
+  const peer = await importPublicKeyForEcdh(peerPubkeyHex);
+  const salt = [myPubkeyHex, peerPubkeyHex].sort().join(":");
+  return deriveAesKey(myEcdhPrivateKey, peer, await sha256Hex(salt));
+}
+
+export async function dmEncrypt(key: CryptoKey, plaintext: string): Promise<{ iv: string; ct: string }> {
+  const iv = new Uint8Array(12);
+  globalThis.crypto.getRandomValues(iv);
+  const ct = await subtle.encrypt({ name: "AES-GCM", iv: iv as BufferSource }, key, utf8Encode(plaintext) as BufferSource);
+  return { iv: bytesToHex(iv), ct: base64UrlEncode(new Uint8Array(ct)) };
+}
+
+export async function dmDecrypt(key: CryptoKey, env: { iv: string; ct: string }): Promise<string | null> {
+  try {
+    const pt = await subtle.decrypt(
+      { name: "AES-GCM", iv: hexToBytes(env.iv) as BufferSource },
+      key,
+      base64UrlDecode(env.ct) as BufferSource,
+    );
+    return new TextDecoder().decode(pt);
+  } catch {
+    return null;
+  }
+}
+
 export async function eciesEncrypt(recipientPubkeyHex: string, plaintext: Uint8Array): Promise<EciesEnvelope> {
   const eph = (await subtle.generateKey(ECDH_PARAMS, true, ["deriveBits"])) as CryptoKeyPair;
   const epkHex = bytesToHex(new Uint8Array(await subtle.exportKey("raw", eph.publicKey)));

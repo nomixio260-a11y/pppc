@@ -39,6 +39,11 @@ jobs:
       - name: Build (typecheck + bundle + self-contained anp.html)
         run: npm run build
 
+      - name: Upload frontend distribution (all files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: anp-frontend
+          path: dist/
       - name: Upload self-contained single-file app
         uses: actions/upload-artifact@v4
         with:

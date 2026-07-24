@@ -1,29 +1,52 @@
-# ANP: Autonomous Network Protocol (v2)
+# ANP Chat — 分散型チャットサービス
 
-ブラウザ完結型・分散チャットネットワークの実装。**ルーム名を入れて参加するだけ**で、Relay 経由で自動的に他の参加者を見つけ、ブラウザ同士が WebRTC で直接つながる。設計書 v1.0 に準拠しつつプロトコルを v2 に進化させている（[進化点](#設計書からのプロトコル進化v2)参照）。
+サーバーにメッセージを預けない分散チャット。**表示名を決めるだけ**で使えて、**チャンネル**（公開グループ）と**DM**（1対1・エンドツーエンド暗号化）を、LINE/Slack のような画面で使えます。相手の発見だけを Relay（軽量な中継サーバー）が担い、チャット本体はブラウザ同士が WebRTC で直接つながって流れます。基盤は自律分散プロトコル ANP v2（[プロトコル詳細](#プロトコル要点)）。
 
-- **デフォルト = オープンルーム（自動探索）**: `network_id = SHA-256("anp-open-v1:"+ルーム名)`。招待不要、URL/ルーム名を共有するだけで誰でも参加。Sybil対策は JOIN の proof-of-work とローカル信頼スコア。
-- **招待制ネットワーク = サブ機能**: 承認した相手だけが入れる非公開ネットワーク（従来の genesis + 招待証明書チェーン）も作れる。
-- 発見は Relay（Nostr風の署名イベント中継）、通信は WebRTC DataChannel、状態は署名付き CRDT と Name Service、永続化は IndexedDB。
+- **チャンネル**: `#名前` の公開ルーム。サイドバーから作成/参加。同じチャンネルを開いた人と自動でつながる。`network_id = SHA-256("anp-open-v1:"+名前)`
+- **DM**: 相手の「ユーザーID」を指定して1対1。本文は2人だけが導出できる ECDH 共有鍵で暗号化され、Relay にも中身は見えない。`network_id = SHA-256("anp-open-v1:dm:"+2人の公開鍵)`、当事者以外は参加不可
+- **複数会話を同時に**保持し、サイドバーで切替（未読バッジつき）
+- 招待制ネットワーク（承認した人だけ）はプロトコルとして残っているが、UIの主役はチャンネル/DM
 
 ```text
-ルーム名 → Network ID → Relayで自動発見 → E2E暗号シグナリング
-        → WebRTCメッシュ → 署名付きCRDT/ファイル同期
+表示名 → 端末に鍵を生成 → チャンネル/DMごとに Network ID
+       → Relayで相手を自動発見 → E2E暗号シグナリング → WebRTC直結
+       → 署名付きCRDTでメッセージ同期（DMは本文も暗号化）
 ```
 
-UI はスマホ対応のモダンなチャットアプリ。ライト/ダーク自動対応。
+## 使い方
 
-## クイックスタート
+### PC / ブラウザ
 
 ```bash
 npm install
-npm start          # ビルドして Relay + クライアントUI を起動
-# → http://localhost:8787/ をブラウザで開く → ルーム名を入れて「参加する」
+npm start          # Relay + フロントを起動 → http://localhost:8787/
 ```
 
-同じルームを別のブラウザ/プロファイル（またはスマホ）で開くと、自動で相互接続してチャットできる。`共有リンクをコピー` で `#room=...` 付きのリンクを配れば、開いてワンタップで参加。
+1. 開いたら**表示名**を入れて「はじめる」。自動で `#general` に入ります。
+2. 左のサイドバーが会話一覧。**「＃ チャンネル」**で公開ルームを作成/参加、**「✉ DM」**で1対1を開始。
+3. 同じ Relay につないだ人が同じチャンネルを開くと自動で接続し、チャットできます。
 
-`public/anp.html` は JS/CSS を全部インライン化した単一ファイル版（Actions の `anp-single-file-html` アーティファクトからも取得可）。Relay 配信のページと同じもので、http(s) 経由で開けば同様に動作する。
+### 📱 スマホでの使い方
+
+スマホのブラウザ（iOS Safari / Android Chrome）で、PCで動かしている Relay の URL を開くだけです。
+
+1. **Relay を公開URLで用意する**（どれか）
+   - 手軽: GitHub の **Actions → "ANP Demo (Cloudflare Tunnel)"** を実行 → 表示された `https://….trycloudflare.com` をスマホで開く（下記デモ参照）
+   - 自前: どこか（VPS等）で `npm start` し、`https://` で公開（スマホの WebRTC/Web Crypto は **https 必須**）
+2. スマホのブラウザでその URL を開く → 表示名を入れて「はじめる」
+3. **画面はスマホ最適化**: 一覧をタップすると会話が全画面で開き、左上の「←」で一覧に戻る。下部の入力欄からメッセージ送信、📎でファイル共有。
+4. **友達を招く**: チャンネルの共有ボタン（右上）で `#channel=名前` 付きリンクをコピー/共有 → 相手が開けば同じチャンネルへ。DM は設定（歯車）→「あなたのID」を相手に渡し、相手のIDで「✉ DM」から開始。
+5. ホーム画面に追加すればアプリのように起動できます（PWA 相当の全画面表示・セーフエリア対応済み）。
+
+> スマホは `https`（またはlocalhost）でないと Web Crypto / WebRTC が動きません。`http://<PCのIP>` 直アクセスでは動かない点に注意（Cloudflare Tunnel を使えば https で解決）。
+
+### フロントだけをダウンロードして配布する
+
+`npm run build` で **`dist/`** フォルダ（`index.html` + `styles.css` + `anp.js` + 単一ファイル版 `anp.html` + 説明書）が生成されます。これがフロント一式です。
+
+- 任意の静的ホスティング（GitHub Pages / Netlify / `npx serve` / nginx …）に `dist/` を置き、Relay を指定すれば動きます。
+- GitHub の Actions 実行結果 → Artifacts の **`anp-frontend`**（フロント一式のzip）／**`anp-single-file-html`**（`anp.html` 単体）からダウンロードできます。
+- 注: 複数ファイル版はブラウザのモジュール制約で `file://` 直開きはできません（http(s) 配信が必要）。`file://` で開きたい場合は単一ファイルの `anp.html` を使ってください。
 
 ### 公開デモ（GitHub Actions + Cloudflare Tunnel）
 
@@ -39,55 +62,62 @@ Tunnel の背後では全クライアントが同一送信元IPに見えるた�
 
 > 注: cloudflared はエッジ接続に outbound port 7844（QUIC/TCP）を使う。GitHub Actions ランナーはこれを許可するが、ポート7844を塞ぐ制限環境ではトンネルが張れずスクリプトが明示エラーで停止する（その場合はビルド・Relay・URL発行までは確認できる）。
 
-複数ノードを試すには、同じURLを **別のブラウザプロファイル**（またはシークレットウィンドウ）で開く。IndexedDB がプロファイルごとに分かれるため、それぞれが独立ノードになる。
+別の端末やブラウザプロファイル（シークレットウィンドウ等）で同じ Relay を開くと、それぞれ独立ユーザーになり、同じチャンネル/相互DMで接続します（IndexedDB がプロファイルごとに分かれる）。
 
-1. ブラウザA: 「ネットワークを作成して参加」→ Genesis 鍵と Network ID が生成される
-2. ブラウザB: 「参加リクエストコードを作成」→ 表示されたコード（公開鍵）をAに渡す
-3. ブラウザA: 「招待を発行」にコードを貼り付け → **招待リンク**（または招待バンドル）をBに渡す
-4. ブラウザB: リンクを開く（バンドル自動入力）→ 参加 → Relay 経由で発見 → WebRTC 直接接続
-5. チャット・**ファイル共有**・Name Service レコードが DataChannel 越しに同期される
-6. 招待の**失効**は「発行済み招待」から。失効すると該当ノード（とその招待で連なる全ノード）が排除される
+- 難易度と起動時間は Run workflow の入力で指定
+- 安定したホスト名が欲しい場合はリポジトリシークレット `CF_TUNNEL_TOKEN`（named tunnel のトークン）と変数 `CF_PUBLIC_URL` を設定
+- ローカルでも同じことができる: `cloudflared` を入れて `DURATION=1800 bash scripts/demo.sh`
+
+Tunnel の背後では全クライアントが同一送信元IPに見えるため、Relay は `ANP_TRUST_PROXY=1` のとき `CF-Connecting-IP` / `X-Forwarded-For` を使ってIP毎レート制限を正しく効かせる（直接公開時はヘッダを信用しない安全側がデフォルト）。
+
+> **「Run workflow」ボタンが出ない場合**: `workflow_dispatch` はワークフローファイルが**デフォルトブランチに存在する場合のみ**手動実行ボタンが出る、というGitHubの仕様。マージ前でも `push` で走る **CI** が `anp-frontend`（フロント一式）と `anp.html` を Artifacts に上げるので、そこから取得できる。
+> cloudflared はエッジ接続に outbound port 7844（QUIC/TCP）を使う。ポート7844を塞ぐ環境ではトンネルが張れず、`scripts/demo.sh` は明示エラーで停止する。
 
 ## コマンド
 
 | コマンド | 説明 |
 |---|---|
-| `npm run build` | 型チェック + クライアントバンドル生成 (`public/anp.js`) |
-| `npm run relay` | Relay サーバー起動（`PORT` / `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY` 環境変数対応） |
+| `npm run build` | 型チェック + フロントビルド（`public/anp.js`・単一ファイル`anp.html`・配布`dist/`） |
+| `npm run relay` | Relay サーバー起動（`PORT` / `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY`） |
 | `npm start` | build + relay |
-| `npm test` | ユニット + Relay 統合テスト（61件） |
-| `npm run test:e2e` | 実ブラウザ3ノードE2E（要 Chromium、Relay自動起動） |
-| `bash scripts/demo.sh` | Relay起動 + Cloudflare Tunnel で公開（`cloudflared` 必要、`DURATION`秒） |
+| `npm test` | ユニット + Relay 統合テスト（70件） |
+| `npm run test:e2e` | 実ブラウザE2E（チャンネル自動探索 + 暗号DM、要 Chromium） |
+| `bash scripts/demo.sh` | Relay起動 + Cloudflare Tunnel で公開 |
 
 ## 構成
 
 ```text
 src/shared/    ブラウザ・Node 共通（Web Crypto ベース）
-  crypto.ts       ECDSA P-256 署名 / SHA-256 / 正規化JSON / CID /
-                  ECIES(ECDH-ES+HKDF+AES-GCM) / 軽量PoW
-  types.ts        プロトコル型定義（イベント・証明書・NSレコード・メンバー）
-  identity.ts     Network ID / Node ID / 招待証明書チェーン（権限昇格防止・
-                  長さ上限・失効対応）/ 招待バンドル
-  events.ts       JOIN(PoW付き) / HEARTBEAT / LEAVE / MANIFEST / SIGNAL(E2E暗号)
-  nameservice.ts  署名付きレコード集合（決定的マージ・TTL・著者別失効レコード抽出）
-  crdt.ts         GSetLog（バージョンベクトル同期・エポックorigin）と LwwMap、
-                  エントリ/セルの署名・検証
-  reputation.ts   ローカル信頼スコア（挙動観測→加点/減点・遮断・プロバイダ順位）
-src/relay/     Relay サーバー（保存・検索・配布のみ。サービス本体ではない）
-  server.ts       WebSocket (EVENT/REQ/EOSE/OK/NOTICE) + REST + TTL sweep +
-                  署名/PoW検証 + メンバーシップゲート + レート制限 + 静的配信
-src/client/    ブラウザノード
-  store.ts        IndexedDB（鍵・メンバー・CRDT・NS・blob）
-  relayclient.ts  複数Relay接続プール（送信キュー・ジッター付きバックオフ・統計）
-  webrtc.ts       WebRTCメッシュ（Trickle ICE・E2E暗号SIGNAL・keepalive・
-                  ハンドシェイクタイムアウト・指数バックオフ再試行）
-  files.ts        service/files: CID検証付きチャンク転送（バックプレッシャー対応）
-  main.ts         参加/招待/失効フロー・メンバーレジストリ・ゴシップ同期・UI
-public/        クライアントUI
-test/          ユニット52件 + 実ブラウザ3ノードE2E
+  crypto.ts       ECDSA P-256署名 / SHA-256 / CID / ECIES / DM共有鍵(ECDH) / 軽量PoW
+  identity.ts     Network ID / Node ID / オープンルーム / DMルーム導出 / 招待チェーン
+  events.ts       JOIN(PoW・オープン/DM/招待) / HEARTBEAT / LEAVE / MANIFEST / SIGNAL(E2E暗号)
+  nameservice.ts  署名付きレコード集合（決定的マージ・著者別失効）
+  crdt.ts         GSetLog（VV同期・エポックorigin・署名エントリ）と LwwMap
+  reputation.ts   ローカル信頼スコア（挙動観測→加減点・遮断）
+src/relay/     Relay サーバー（発見の中継のみ。メッセージ本体は持たない）
+  server.ts       WebSocket + REST + TTL + 署名/PoW検証 + メンバーシップゲート + レート制限
+src/client/    フロント
+  conversation.ts 1会話ぶんのランタイム（Relay購読 + WebRTCメッシュ + チャットCRDT + DM暗号）
+  main.ts         オーケストレータ（アイデンティティ + 会話一覧 + サイドバーUI）
+  webrtc.ts       WebRTCメッシュ（Trickle ICE・E2E暗号SIGNAL・keepalive・再試行）
+  relayclient.ts  複数Relay接続プール（送信キュー・バックオフ）
+  files.ts        ファイル共有（CID検証付きチャンク転送）
+  store.ts        IndexedDB（IndexedDB不可環境はメモリfallback）
+public/        フロントUI（index.html / styles.css / ビルド生成物）
+dist/          配布用フロント一式（ビルドで生成）
+test/          ユニット70件 + 実ブラウザE2E
 ```
 
+以下は基盤プロトコル ANP v2 の詳細（チャットUIはこの上に構築）。
+
 ## プロトコル要点
+
+### 会話モデル（チャンネル / DM）
+
+- **チャンネル**: オープンルーム。`network_id = SHA-256("anp-open-v1:"+正規化した名前)`。JOIN は招待チェーン不要で、署名 + PoW のみ。同名チャンネルを開いた全員が同じ `network_id` を計算して Relay で出会い、WebRTC メッシュを組む。
+- **DM**: `network_id = SHA-256("anp-open-v1:dm:"+ソートした2つの公開鍵)`。当事者2人だけがこの値を計算でき、`verifyEvent` は DM ルームへの JOIN を**当事者2名の公開鍵に限定**する（第三者は参加不可）。本文は両者が `ECDH(自分の秘密鍵, 相手の公開鍵)` から HKDF で導く同一の AES-256-GCM 鍵で暗号化するため、Relay も第三者も復号できない。CRDT エントリはこの暗号文を運び、表示時に復号する。
+- 各会話は独立した `Conversation`（Relay購読 + メッシュ + チャットCRDT）。1つのアイデンティティ（端末の鍵）で複数を並行実行し、サイドバーで切替える。
+- **プライバシー注記**: DM の**本文**は秘匿されるが、Relay は「ある `network_id` に2つの JOIN がある」というメタデータは観測しうる（誰と誰か＝公開鍵は、room 文字列を持たない限り即座には分からないが、相関の余地は残る）。完全なメタデータ秘匿（誰が誰とやり取りしたか）はミックスネット等が必要で本実装の範囲外。
 
 ### Identity（設計書 §4, §12）
 
@@ -156,13 +186,17 @@ DataChannel を確立した SDP は宛先ノード鍵に暗号化されている
 | 10 | 招待リンク / identity エクスポート・インポート / sendBeacon LEAVE | 実運用のUX |
 | 11 | ローカル信頼スコア（Phase 4） | 挙動観測で悪意ノードを自動遮断・プロバイダ選好 |
 | 12 | Relay動的編集 + Genesis署名bootstrap採用 | 固定URLのままRelayを移行・冗長化 |
-| 13 | オープンルーム（招待不要・自動探索）をデフォルトに、招待制をサブ機能へ | ルーム名を入れるだけで参加でき、招待の手間なくすぐ使える |
-| 14 | スマホ対応のモダンなチャットUIに全面刷新 | メッセージバブル・アバター・ドロワー・ライト/ダーク |
+| 13 | オープンルーム（招待不要・自動探索）をデフォルトに、招待制をサブ機能へ | すぐ使えるチャットに |
+| 14 | スマホ対応のモダンなチャットUIに全面刷新 | バブル・アバター・ドロワー・ライト/ダーク |
+| 15 | **チャンネル＋DM（複数会話の同時実行）+ サイドバー** | 本物のチャットサービスの会話モデル |
+| 16 | **DMの本文暗号化**（当事者2人がECDHで導く共有鍵・AES-GCM） | 1対1は当事者以外（Relay含む）復号不可、第三者はDM網に参加不可 |
+| 17 | フロント一式(`dist/`)配布 + 相対パス化 | 任意の静的ホストに置ける／Actionsアーティファクト化 |
 
 **設計上の既知のトレードオフ**: JOIN の招待チェーンは Relay がスパム対策として検証するため、Relay はネットワークのメンバーグラフ（公開鍵・招待関係・ニックネーム）を観測できる。SDP・チャット・ファイルは見えない。メンバーグラフも隠す場合は Relay の検証を放棄する必要があり、本実装では検証を優先した。
 
 ## 検証
 
-- `npm test`: 67件 — 暗号（ECIES正逆・鍵違い・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、**オープンルーム（room束縛JOIN・招待網への侵入不可・PoW必須）**、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/期限切れ復帰/著者別失効/squat防止/重複再ゴシップ抑止）、信頼スコア（加減点/遮断/順位/減衰）、Relay統合（メンバーシップゲート/不正イベント耐性/SIGNAL宛先配布）
-- `npm run test:e2e`: 実ブラウザ3ノード — **ワンタップでオープンルームに参加→自動探索→WebRTC接続**、署名チャット双方向同期、CID検証ファイル転送、共有リンクからの参加、参加前履歴の受信、**Relay停止中のP2P継続**、Relay再起動後の再接続
+- `npm test`: 70件 — 暗号（ECIES・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、**オープンルーム（room束縛JOIN・招待網侵入不可・PoW必須）**、**DM（共有鍵の対称性・第三者は復号/参加不可）**、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/著者別失効/squat防止/再ゴシップ抑止）、信頼スコア、Relay統合（メンバーシップゲート/不正イベント耐性）
+- `npm run test:e2e`: 実ブラウザ — **表示名だけで #general に自動参加→自動探索→WebRTC接続**、チャンネル双方向チャット、CID検証ファイル転送、**ECDH暗号DMの双方向同期**、共有リンクからのチャンネル参加。スマホ(390px)/PC 両ビューポートでスクリーンショット確認済み
+- 4ラウンドの敵対的監査（AIエージェントによる多次元レビュー＋反証検証）を実施し、各ラウンドの確認済み欠陥をすべて修正（クリティカル: Relayクラッシュ、失効un-revoke攻撃、NSゴシップ無限ストーム 等）
 - 4ラウンドの敵対的監査（AIエージェントによる多次元レビュー＋反証検証）を実施し、各ラウンドの確認済み欠陥をすべて修正（クリティカル: Relayクラッシュ、失効un-revoke攻撃、NSゴシップ無限ストーム 等）

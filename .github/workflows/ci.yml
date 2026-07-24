@@ -21,10 +21,16 @@ jobs:
         run: node scripts/build.mjs
       - name: Unit & integration tests
         run: npm test
+      - name: Upload frontend distribution (all files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: anp-frontend
+          path: dist/
+          # download, extract, host the folder on any static server (or open
+          # anp.html directly); point it at a relay to chat.
       - name: Upload self-contained single-file app
         uses: actions/upload-artifact@v4
         with:
           name: anp-single-file-html
           path: public/anp.html
-          # download this artifact, open the .html in a browser — no server needed
 

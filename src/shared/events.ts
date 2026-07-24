@@ -26,7 +26,7 @@ import {
   utf8Encode,
   verifyObject,
 } from "./crypto.js";
-import { nodeIdFromPubkey, openNetworkId, verifyInviteChain } from "./identity.js";
+import { dmPubkeys, isDmRoom, nodeIdFromPubkey, openNetworkId, verifyInviteChain } from "./identity.js";
 import type {
   AnpEvent,
   EventType,
@@ -152,6 +152,13 @@ async function verifyEventInner(event: AnpEvent, opts: VerifyOptions): Promise<V
       }
       if ((await openNetworkId(body.room)) !== network_id) {
         return { ok: false, reason: "room does not match network id" };
+      }
+      // DM rooms admit exactly the two named parties — no one else may join
+      if (isDmRoom(body.room)) {
+        const pair = dmPubkeys(body.room);
+        if (!pair || !pair.includes(pubkey)) {
+          return { ok: false, reason: "not a party to this DM" };
+        }
       }
       // signature + PoW already verified; anyone may join an open room
     } else {
