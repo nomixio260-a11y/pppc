@@ -25,7 +25,9 @@ npm start          # ビルドして Relay + クライアントUI を起動
 - 安定したホスト名が欲しい場合はリポジトリシークレット `CF_TUNNEL_TOKEN`（named tunnel のトークン）と変数 `CF_PUBLIC_URL` を設定
 - ローカルでも同じことができる: `cloudflared` を入れて `DURATION=1800 bash scripts/demo.sh`
 
-Tunnel の背後では全クライアントが同一送信元IPに見えるため、Relay は `ANP_TRUST_PROXY=1` のとき `CF-Connecting-IP` / `X-Forwarded-For` を使ってIP毎レート制限を正しく効かせる（直接公開時はヘッダを信用しない安全側がデフォルト）。
+Tunnel の背後では全クライアントが同一送信元IPに見えるため、Relay は `ANP_TRUST_PROXY=1` のとき `CF-Connecting-IP` / `X-Forwarded-For` を使ってIP毎レート制限を正しく効かせる（直接公開時はヘッダを信用しない安全側がデフォルト）。`scripts/demo.sh` はトンネルがエッジに接続登録されるまで待ってからURLを提示するので、到達不能なURLを渡さない。
+
+> 注: cloudflared はエッジ接続に outbound port 7844（QUIC/TCP）を使う。GitHub Actions ランナーはこれを許可するが、ポート7844を塞ぐ制限環境ではトンネルが張れずスクリプトが明示エラーで停止する（その場合はビルド・Relay・URL発行までは確認できる）。
 
 複数ノードを試すには、同じURLを **別のブラウザプロファイル**（またはシークレットウィンドウ）で開く。IndexedDB がプロファイルごとに分かれるため、それぞれが独立ノードになる。
 

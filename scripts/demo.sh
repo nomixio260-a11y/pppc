@@ -70,12 +70,32 @@ else
     if [[ -n "$URL" ]]; then PUBLIC_URL="$URL"; break; fi
     sleep 0.5
   done
-fi
 
-if [[ -z "$PUBLIC_URL" ]]; then
-  echo "failed to obtain a tunnel URL; cloudflared log:" >&2
-  cat "$CF_LOG" >&2
-  exit 1
+  if [[ -z "$PUBLIC_URL" ]]; then
+    echo "failed to obtain a tunnel URL; cloudflared log:" >&2
+    cat "$CF_LOG" >&2
+    exit 1
+  fi
+
+  # A URL is minted before the edge connection is up. Wait for the tunnel to
+  # actually register a connection so we never hand out a dead URL. If the
+  # environment blocks cloudflared's edge protocol (outbound port 7844), say so
+  # clearly instead of pretending the demo is reachable.
+  log "waiting for the tunnel to connect to Cloudflare's edge"
+  REGISTERED=0
+  for _ in $(seq 1 60); do
+    if grep -qi "Registered tunnel connection" "$CF_LOG"; then REGISTERED=1; break; fi
+    kill -0 "$CF_PID" 2>/dev/null || break
+    sleep 0.5
+  done
+  if [[ "$REGISTERED" != "1" ]]; then
+    echo "tunnel URL was created ($PUBLIC_URL) but never connected to Cloudflare's edge." >&2
+    echo "This environment likely blocks cloudflared's outbound edge protocol (TCP/UDP port 7844)." >&2
+    echo "GitHub Actions runners allow it; a restricted sandbox may not. cloudflared log tail:" >&2
+    tail -n 15 "$CF_LOG" >&2
+    exit 1
+  fi
+  log "edge connection registered"
 fi
 
 log "PUBLIC URL: $PUBLIC_URL"
