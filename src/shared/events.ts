@@ -26,7 +26,7 @@ import {
   utf8Encode,
   verifyObject,
 } from "./crypto.js";
-import { nodeIdFromPubkey, verifyInviteChain } from "./identity.js";
+import { nodeIdFromPubkey, openNetworkId, verifyInviteChain } from "./identity.js";
 import type {
   AnpEvent,
   EventType,
@@ -143,9 +143,22 @@ async function verifyEventInner(event: AnpEvent, opts: VerifyOptions): Promise<V
     if (powBits > 0 && !hasPow(event.id, powBits)) {
       return { ok: false, reason: `insufficient proof-of-work (need ${powBits} bits)` };
     }
-    const chain = (event.body?.invite_chain ?? []) as InviteCertificate[];
-    const check = await verifyInviteChain(network_id, chain, pubkey, now, opts.revoked);
-    if (!check.ok) return { ok: false, reason: `invite chain: ${check.reason}` };
+    const body = event.body;
+    if (body?.open) {
+      // open room: the network id must bind to the declared room name, so an
+      // "open" join can never be used to slip into an invite-only network.
+      if (typeof body.room !== "string" || !body.room) {
+        return { ok: false, reason: "open join missing room" };
+      }
+      if ((await openNetworkId(body.room)) !== network_id) {
+        return { ok: false, reason: "room does not match network id" };
+      }
+      // signature + PoW already verified; anyone may join an open room
+    } else {
+      const chain = (body?.invite_chain ?? []) as InviteCertificate[];
+      const check = await verifyInviteChain(network_id, chain, pubkey, now, opts.revoked);
+      if (!check.ok) return { ok: false, reason: `invite chain: ${check.reason}` };
+    }
   }
   if (event.type === "SIGNAL") {
     const body = event.body as SignalBody;
@@ -169,13 +182,26 @@ async function verifyEventInner(event: AnpEvent, opts: VerifyOptions): Promise<V
  * Build a JOIN event, grinding `pow_nonce` until the event id satisfies the
  * proof-of-work target, then signing once.
  */
+export interface JoinOptions {
+  nickname?: string;
+  powBits?: number;
+  /** open-room join: no invite chain; `room` binds to the network id */
+  open?: boolean;
+  room?: string;
+}
+
 export async function createJoin(
   networkId: NetworkId,
   keys: KeyPairHandle,
   inviteChain: InviteCertificate[],
-  nickname?: string,
-  powBits = POW_BITS,
+  nicknameOrOpts?: string | JoinOptions,
+  powBitsArg = POW_BITS,
 ): Promise<AnpEvent> {
+  const opts: JoinOptions =
+    typeof nicknameOrOpts === "string" || nicknameOrOpts === undefined
+      ? { nickname: nicknameOrOpts, powBits: powBitsArg }
+      : nicknameOrOpts;
+  const powBits = opts.powBits ?? POW_BITS;
   const createdAt = nowSeconds();
   const event = {
     id: "",
@@ -190,7 +216,8 @@ export async function createJoin(
       transport: { kind: "webrtc" as const },
       invite_chain: inviteChain,
       pow_nonce: "",
-      nickname,
+      nickname: opts.nickname,
+      ...(opts.open ? { open: true, room: opts.room } : {}),
     },
     signature: "",
   } as AnpEvent;

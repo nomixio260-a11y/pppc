@@ -21,15 +21,12 @@
 import {
   type KeyPairHandle,
   type StoredKeyPair,
-  base64UrlDecode,
-  base64UrlEncode,
   exportKeyPair,
   generateKeyPair,
   importKeyPair,
   importPrivateKeyForEcdh,
   nowSeconds,
   randomHex,
-  utf8Encode,
 } from "../shared/crypto.js";
 import {
   anpUrl,
@@ -38,6 +35,8 @@ import {
   issueCertificate,
   networkIdFromGenesisPubkey,
   nodeIdFromPubkey,
+  normalizeRoom,
+  openNetworkId,
   verifyInviteChain,
 } from "../shared/identity.js";
 import {
@@ -90,6 +89,10 @@ interface NodeConfig {
   relays: string[];
   nickname: string;
   is_genesis: boolean;
+  /** open room (default discovery mode): invite-less, auto-join */
+  open: boolean;
+  /** room name (only for open networks) */
+  room?: string;
 }
 
 interface IssuedInvite {
@@ -176,9 +179,6 @@ let pool: RelayPool | undefined;
 let mesh: Mesh | undefined;
 let files: FileService | undefined;
 let reputation = new Reputation();
-/** offline joiner: keep the setup screen visible (to copy the answer) until
- * the manual DataChannel actually opens */
-let deferMainView = false;
 let chatLog: GSetLog | undefined;
 let profileMap: LwwMap | undefined;
 let nameService: NameServiceStore | undefined;
@@ -277,6 +277,9 @@ async function verifyMembership(
   forHistory = false,
 ): Promise<{ ok: boolean; rights: Right[]; reason?: string }> {
   if (!config) return { ok: false, rights: [], reason: "not joined" };
+  // open room: anyone with a valid key is a member (no invite chain). Sybil
+  // resistance is JOIN proof-of-work + the local trust score.
+  if (config.open) return { ok: true, rights: ["join", "chat", "store"] };
   return verifyInviteChain(config.network_id, chain, pubkey, nowSeconds(), revocations, forHistory);
 }
 
@@ -420,6 +423,32 @@ async function applyRevocations(): Promise<void> {
 // Setup flows
 // ---------------------------------------------------------------------------
 
+/** Default flow: join an OPEN room by name (invite-less, auto-discovery). */
+async function joinRoom(room: string, nickname: string, relays: string[]): Promise<void> {
+  const roomName = normalizeRoom(room) || "lobby";
+  const networkId = await openNetworkId(roomName);
+  // reuse a persisted node key if we have one, else generate
+  let stored = await store.get<StoredKeyPair>("kv", "nodeKeys");
+  if (!stored) {
+    stored = await exportKeyPair(await generateKeyPair());
+    await store.put("kv", "nodeKeys", stored);
+  }
+  await store.delete("kv", "genesisKeys");
+  await store.put("kv", "inviteChain", []);
+  const cfg: NodeConfig = {
+    network_id: networkId,
+    relays: relays.length ? relays : defaultRelays(),
+    nickname,
+    is_genesis: false,
+    open: true,
+    room: roomName,
+  };
+  await store.put("kv", "config", cfg);
+  log(`joining open room "${roomName}"`);
+  await boot();
+}
+
+/** Advanced: create a private, invite-only network (genesis-rooted). */
 async function createNetwork(nickname: string, relays: string[]): Promise<void> {
   const genesis = await generateKeyPair();
   const node = await generateKeyPair();
@@ -433,9 +462,15 @@ async function createNetwork(nickname: string, relays: string[]): Promise<void> 
   await store.put("kv", "genesisKeys", await exportKeyPair(genesis));
   await store.put("kv", "nodeKeys", await exportKeyPair(node));
   await store.put("kv", "inviteChain", [cert]);
-  const cfg: NodeConfig = { network_id: networkId, relays, nickname, is_genesis: true };
+  const cfg: NodeConfig = {
+    network_id: networkId,
+    relays: relays.length ? relays : defaultRelays(),
+    nickname,
+    is_genesis: true,
+    open: false,
+  };
   await store.put("kv", "config", cfg);
-  toast(`ネットワークを作成しました`, "ok");
+  toast(`招待制ネットワークを作成しました`, "ok");
   log(`network created: ${anpUrl(networkId)}`);
   await boot();
 }
@@ -464,124 +499,13 @@ async function acceptInvite(bundleText: string, nickname: string): Promise<void>
     relays: bundle.relays.length ? bundle.relays : defaultRelays(),
     nickname,
     is_genesis: false,
+    open: false,
   };
   await store.put("kv", "config", cfg);
   toast("参加しました", "ok");
   log(`invite accepted for ${anpUrl(bundle.network_id)}`);
   history.replaceState(null, "", location.pathname); // drop #invite=… from the URL
   await boot();
-}
-
-// ---------------------------------------------------------------------------
-// Offline / manual connection (no relay, no server)
-//
-// Two people exchange one text blob each way, over any channel (chat app,
-// email, QR). Works when the page is opened straight from a downloaded file.
-//   1. joiner  -> inviter : request code (joiner's public key)
-//   2. inviter -> joiner  : OFFER blob (invite chain + inviter identity + SDP)
-//   3. joiner  -> inviter : ANSWER blob (joiner identity + SDP)
-// After step 3 the DataChannel opens and the two nodes sync as usual.
-// ---------------------------------------------------------------------------
-
-interface OfferBlob {
-  v: 1;
-  t: "anp-offer";
-  network_id: string;
-  genesis_pubkey: string;
-  chain: InviteCertificate[];
-  from_node: string;
-  from_pubkey: string;
-  sdp: string;
-}
-
-interface AnswerBlob {
-  v: 1;
-  t: "anp-answer";
-  network_id: string;
-  from_node: string;
-  from_pubkey: string;
-  nickname?: string;
-  sdp: string;
-}
-
-function encodeBlob(value: unknown): string {
-  return base64UrlEncode(utf8Encode(JSON.stringify(value)));
-}
-function decodeBlob<T>(text: string): T {
-  return JSON.parse(new TextDecoder().decode(base64UrlDecode(text.trim()))) as T;
-}
-
-/** Inviter side: from the joiner's request code, issue an invite AND a manual
- * WebRTC offer, bundled into one blob to hand back. */
-async function offlineCreateOffer(subjectPubkey: string, grantInvite: boolean): Promise<string> {
-  if (!config || !nodeKeys || !mesh) throw new Error("先にネットワークに参加してください");
-  if (!/^[0-9a-f]{130}$/.test(subjectPubkey)) throw new Error("参加リクエストコードの形式が不正です");
-  const { chain } = await buildInviteChain(subjectPubkey, grantInvite);
-  const peerNode = await nodeIdFromPubkey(subjectPubkey);
-  const sdp = await mesh.manualCreateOffer(peerNode, subjectPubkey);
-  const blob: OfferBlob = {
-    v: 1,
-    t: "anp-offer",
-    network_id: config.network_id,
-    genesis_pubkey: genesisKeys?.publicKeyHex ?? inviteChain[0]!.issuer_pubkey,
-    chain,
-    from_node: myNodeId,
-    from_pubkey: nodeKeys.publicKeyHex,
-    sdp,
-  };
-  toast("オファーを作成しました。相手に渡してください", "ok");
-  return encodeBlob(blob);
-}
-
-/** Joiner side: accept the offer blob — join the network in place, then
- * produce an answer blob. */
-async function offlineAcceptOffer(offerText: string, nickname: string): Promise<string> {
-  const blob = decodeBlob<OfferBlob>(offerText);
-  if (blob.t !== "anp-offer" || !blob.network_id || !Array.isArray(blob.chain)) {
-    throw new Error("オファーの形式が不正です");
-  }
-  const storedKeys = await store.get<StoredKeyPair>("kv", "pendingKeys");
-  if (!storedKeys) throw new Error("先に参加リクエストコードを作成してください");
-  const check = await verifyInviteChain(blob.network_id, blob.chain, storedKeys.publicKeyHex);
-  if (!check.ok) throw new Error(`招待証明書が不正です: ${check.reason}`);
-
-  // join in place (no reload): store config+keys and start the node. Keep the
-  // setup screen visible until connected so the answer blob can be copied.
-  await store.put("kv", "nodeKeys", storedKeys);
-  await store.put("kv", "inviteChain", blob.chain);
-  await store.delete("kv", "pendingKeys");
-  await store.put("kv", "config", {
-    network_id: blob.network_id,
-    relays: [], // offline: no relay
-    nickname,
-    is_genesis: false,
-  } satisfies NodeConfig);
-  deferMainView = true;
-  await boot();
-  if (!mesh) throw new Error("ノードの起動に失敗しました");
-
-  const sdp = await mesh.manualAcceptOffer(blob.sdp, blob.from_node, blob.from_pubkey);
-  const answer: AnswerBlob = {
-    v: 1,
-    t: "anp-answer",
-    network_id: blob.network_id,
-    from_node: myNodeId,
-    from_pubkey: nodeKeys!.publicKeyHex,
-    nickname,
-    sdp,
-  };
-  toast("参加しました。アンサーを相手に返してください", "ok");
-  return encodeBlob(answer);
-}
-
-/** Inviter side: apply the joiner's answer blob to finish the connection. */
-async function offlineAcceptAnswer(answerText: string): Promise<void> {
-  if (!mesh) throw new Error("not joined");
-  const blob = decodeBlob<AnswerBlob>(answerText);
-  if (blob.t !== "anp-answer" || !blob.sdp || !blob.from_node) throw new Error("アンサーの形式が不正です");
-  if ((await nodeIdFromPubkey(blob.from_pubkey)) !== blob.from_node) throw new Error("アンサーの識別子が不整合です");
-  await mesh.manualAcceptAnswer(blob.sdp, blob.from_node);
-  toast("接続を完了しました", "ok");
 }
 
 /** Issue a certificate for `subjectPubkey`, returning the full chain that
@@ -737,9 +661,11 @@ async function startNode(): Promise<void> {
   myNodeId = await nodeIdFromPubkey(nodeKeys.publicKeyHex);
   const ecdhKey = await importPrivateKeyForEcdh(nodeStoredKeys.privateJwk);
 
-  const chainCheck = await verifyInviteChain(config.network_id, inviteChain, nodeKeys.publicKeyHex);
+  // rights: open rooms grant chat/store to everyone; invite networks derive
+  // them from the local invite chain (verifyMembership handles both)
+  const chainCheck = await verifyMembership(nodeKeys.publicKeyHex, inviteChain);
   myRights = chainCheck.ok ? chainCheck.rights : [];
-  if (!chainCheck.ok && !genesisKeys) {
+  if (!chainCheck.ok && !genesisKeys && !config.open) {
     log(`warning: local invite chain invalid (${chainCheck.reason})`);
     toast(`招待チェーンが無効です: ${chainCheck.reason}`, "error");
   }
@@ -787,19 +713,14 @@ async function startNode(): Promise<void> {
           profile_lamport: 0,
         });
       }
-      // offline joiner: the setup screen was kept up so the answer could be
-      // copied; now that we're connected, switch to the main view
-      if (deferMainView) {
-        deferMainView = false;
-        showMain();
-        renderAll();
-      }
       renderPeers();
+      renderConn();
     },
     onPeerClose: (nodeId, reason) => {
       if (reason === "keepalive timeout") reputation.record(nodeId, "keepalive-timeout");
       else if (reason?.startsWith("pc ")) reputation.record(nodeId, "pc-failed");
       renderPeers();
+      renderConn();
     },
     onMessage: (from, msg) => void handleDcMessage(from, msg),
     log,
@@ -844,12 +765,8 @@ async function startNode(): Promise<void> {
   );
 
   latestLeave = await createLeave(config.network_id, nodeKeys);
-  // an offline joiner keeps the setup screen up until connected, so it can copy
-  // the answer blob; otherwise switch to the main view immediately
-  if (!deferMainView) {
-    showMain();
-    renderAll();
-  }
+  showMain();
+  renderAll();
   log(`node started: ${short(myNodeId)} on ${anpUrl(config.network_id)} (proto v2)`);
 }
 
@@ -863,7 +780,13 @@ async function refreshJoin(force = false): Promise<void> {
     pool.publish(cachedJoin);
     return;
   }
-  cachedJoin = await createJoin(config.network_id, nodeKeys, inviteChain, config.nickname);
+  cachedJoin = config.open
+    ? await createJoin(config.network_id, nodeKeys, [], {
+        open: true,
+        room: config.room,
+        nickname: config.nickname,
+      })
+    : await createJoin(config.network_id, nodeKeys, inviteChain, config.nickname);
   pool.publish(cachedJoin);
 }
 
@@ -1267,7 +1190,9 @@ async function publishRecord(name: string, valueText: string): Promise<void> {
 // Leave / reset
 // ---------------------------------------------------------------------------
 
-async function leaveNetwork(): Promise<void> {
+/** Tear down the running node. `forSwitch` resets state so a fresh startNode
+ * (a room change) can run cleanly; otherwise the caller reloads the page. */
+async function leaveNetwork(forSwitch = false): Promise<void> {
   if (config && nodeKeys && pool) {
     pool.publish(await createLeave(config.network_id, nodeKeys));
   }
@@ -1275,15 +1200,21 @@ async function leaveNetwork(): Promise<void> {
   pool?.stop();
   for (const t of timers) clearInterval(t);
   timers = [];
-  log("left network (identity kept — reload to rejoin)");
-  // don't leave a zombie UI behind: disable inputs, offer a rejoin control
-  ($("chat-input") as HTMLInputElement).disabled = true;
-  ($("btn-send") as HTMLButtonElement).disabled = true;
-  ($("btn-file") as HTMLButtonElement).disabled = true;
-  const leaveBtn = $("btn-leave") as HTMLButtonElement;
-  leaveBtn.textContent = "再参加 (リロード)";
-  leaveBtn.onclick = () => location.reload();
-  toast("LEAVE を送信して切断しました", "info");
+  // reset per-node runtime state
+  mesh = undefined;
+  pool = undefined;
+  files = undefined;
+  chatLog = undefined;
+  profileMap = undefined;
+  nameService = undefined;
+  members.clear();
+  pendingEntries.clear();
+  pendingEntryTotal = 0;
+  proofRequested.clear();
+  cachedJoin = undefined;
+  announced = false;
+  nodeStarted = false;
+  if (!forSwitch) log("left network");
 }
 
 let beaconSent = false;
@@ -1307,15 +1238,41 @@ async function resetIdentity(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Relay editing
+// ---------------------------------------------------------------------------
+
+async function addRelayUrl(url: string): Promise<void> {
+  if (!config || !pool) return;
+  if (!/^wss?:\/\//.test(url)) throw new Error("Relay URL は ws:// または wss:// で始めてください");
+  if (config.relays.includes(url)) throw new Error("既に追加済みです");
+  config.relays = [...config.relays, url];
+  await store.put("kv", "config", config);
+  pool.addRelay(url);
+  renderRelays();
+  toast(`Relay を追加しました`, "ok");
+}
+
+async function removeRelay(url: string): Promise<void> {
+  if (!config || !pool) return;
+  config.relays = config.relays.filter((r) => r !== url);
+  await store.put("kv", "config", config);
+  pool.removeRelay(url);
+  renderRelays();
+  toast(`Relay を削除しました`, "info");
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
 function showMain(): void {
-  $("setup").hidden = true;
-  $("main").hidden = false;
+  $("welcome").hidden = true;
+  $("app").hidden = false;
 }
 
 function renderAll(): void {
+  renderTopbar();
+  renderConn();
   renderIdentity();
   renderRelays();
   renderPeers();
@@ -1324,57 +1281,79 @@ function renderAll(): void {
   renderInvites();
 }
 
+const AVATAR_COLORS = ["#6d5efc", "#e0567a", "#20a4a4", "#e0952b", "#3b82f6", "#8b5cf6", "#16a34a", "#db2777"];
+function avatarColor(id: string): string {
+  let h = 0;
+  for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length]!;
+}
+function initial(name: string): string {
+  return (name.trim()[0] ?? "?").toUpperCase();
+}
+function avatarHtml(nodeId: string): string {
+  const name = nicknameOf(nodeId);
+  return `<span class="avatar" style="background:${avatarColor(nodeId)}">${escapeHtml(initial(name))}</span>`;
+}
+
+function renderTopbar(): void {
+  if (!config) return;
+  $("room-title").textContent = config.open ? `#${config.room ?? "lobby"}` : "🔒 招待制";
+}
+
+function renderConn(): void {
+  const connected = mesh ? mesh.connectedNodeIds().length : 0;
+  const relaysUp = pool ? pool.connectedCount() : 0;
+  const dot = $("conn-dot");
+  const text = $("conn-text");
+  dot.className = "dot";
+  if (connected > 0) {
+    dot.classList.add("ok");
+    text.textContent = `${connected}人と直接接続中`;
+  } else if (relaysUp > 0) {
+    dot.classList.add("warn");
+    text.textContent = "参加者を探索中…";
+  } else if (config && config.relays.length === 0) {
+    dot.classList.add("ng");
+    text.textContent = "Relay未設定（メニューから追加）";
+  } else {
+    dot.classList.add("ng");
+    text.textContent = "Relayに接続中…";
+  }
+}
+
 function renderIdentity(): void {
   if (!config) return;
-  $("net-url").textContent = anpUrl(config.network_id);
-  $("net-node-id").textContent = myNodeId;
-  $("net-nickname").textContent = config.nickname;
-  $("net-rights").textContent = myRights.join(", ") || "(なし)";
-  $("net-role").textContent = config.is_genesis ? "creator (genesis 保持)" : "member";
-  $("invite-card").hidden = !(genesisKeys || myRights.includes("invite"));
+  ($("d-nick") as HTMLInputElement).value = config.nickname;
+  $("d-node-id").textContent = short(myNodeId);
+  $("d-net-url").textContent = anpUrl(config.network_id);
+  $("d-role").textContent = config.open
+    ? `オープンルーム #${config.room ?? "lobby"}`
+    : config.is_genesis
+      ? "招待制（作成者）"
+      : "招待制（メンバー）";
+  // invite issuance only makes sense on an invite-only network we can invite into
+  $("invite-card").hidden = config.open || !(genesisKeys || myRights.includes("invite"));
 }
 
 function renderRelays(): void {
   if (!pool) return;
-  const now = nowSeconds();
-  const parts = pool.statsSnapshot().map((s) => {
-    const age = s.lastEventAt ? `${now - s.lastEventAt}s前` : "—";
-    const err = s.lastError ? ` <span class="ng-text">${escapeHtml(s.lastError)}</span>` : "";
-    const canDrop = (config?.relays.length ?? 0) > 1;
-    const rm = canDrop
-      ? `<button class="mini relay-rm" data-url="${escapeHtml(s.url)}">削除</button>`
-      : "";
-    return `<li><span class="dot ${s.connected ? "ok" : "ng"}"></span>${escapeHtml(s.url)}
-      <span class="muted small">受信 ${s.eventsReceived} / 最終 ${age}${err}</span> ${rm}</li>`;
-  });
-  $("relay-list").innerHTML = parts.join("");
-  for (const btn of $("relay-list").querySelectorAll<HTMLButtonElement>(".relay-rm")) {
-    btn.onclick = () => void removeRelay(btn.dataset["url"]!);
-  }
-}
-
-async function addRelayUrl(url: string): Promise<void> {
-  if (!config || !pool) return;
-  if (!/^wss?:\/\//.test(url)) throw new Error("Relay URL は ws:// または wss:// で始まる必要があります");
-  if (config.relays.includes(url)) throw new Error("既に追加済みです");
-  config.relays = [...config.relays, url];
-  await store.put("kv", "config", config);
-  pool.addRelay(url);
-  renderRelays();
-  toast(`Relay を追加しました: ${url}`, "ok");
-}
-
-async function removeRelay(url: string): Promise<void> {
-  if (!config || !pool) return;
-  if (config.relays.length <= 1) {
-    toast("最後のRelayは削除できません", "error");
+  const list = $("relay-list");
+  const stats = pool.statsSnapshot();
+  if (stats.length === 0) {
+    list.innerHTML = `<li class="muted">Relay 未設定（オープンルームは Relay で参加者を探します）</li>`;
     return;
   }
-  config.relays = config.relays.filter((r) => r !== url);
-  await store.put("kv", "config", config);
-  pool.removeRelay(url);
-  renderRelays();
-  toast(`Relay を削除しました: ${url}`, "info");
+  list.innerHTML = stats
+    .map(
+      (s) =>
+        `<li><span class="dot ${s.connected ? "ok" : "ng"}"></span>
+         <span style="flex:1;min-width:0;word-break:break-all">${escapeHtml(s.url)}</span>
+         <button class="btn small relay-rm" data-url="${escapeHtml(s.url)}">削除</button></li>`,
+    )
+    .join("");
+  for (const btn of list.querySelectorAll<HTMLButtonElement>(".relay-rm")) {
+    btn.onclick = () => void removeRelay(btn.dataset["url"]!).catch((e) => toast((e as Error).message, "error"));
+  }
 }
 
 function nicknameOf(nodeId: NodeId): string {
@@ -1389,73 +1368,76 @@ function renderPeers(): void {
   if (!mesh) return;
   const connected = new Set(mesh.connectedNodeIds());
   const now = nowSeconds();
-  const rows = [...mesh.peers.values()]
-    .sort((a, b) => a.node_id.localeCompare(b.node_id))
-    .map((peer) => {
-      const state = connected.has(peer.node_id)
-        ? `<span class="dot ok"></span>P2P接続中`
-        : now - peer.last_seen <= HEARTBEAT_TTL * 2
-          ? `<span class="dot warn"></span>発見済み`
-          : `<span class="dot ng"></span>応答なし`;
-      const verified = members.has(peer.node_id)
-        ? `<span class="badge ok-badge">検証済み</span>`
-        : `<span class="badge">未検証</span>`;
-      const score = Math.round(reputation.scoreOf(peer.node_id));
-      const banned = reputation.isBanned(peer.node_id);
-      const trustClass = banned ? "ng-text" : score > 0 ? "ok-badge" : "";
-      const trust = `<span class="badge ${trustClass}" title="信頼スコア (ローカル)">信頼 ${score}${banned ? " ⛔" : ""}</span>`;
-      const reset = score !== 0
-        ? `<button class="mini trust-reset" data-id="${escapeHtml(peer.node_id)}">リセット</button>`
+  const peers = [...mesh.peers.values()].sort((a, b) => a.node_id.localeCompare(b.node_id));
+  const rows = peers.map((peer) => {
+    const online = connected.has(peer.node_id);
+    const seen = now - peer.last_seen <= HEARTBEAT_TTL * 2;
+    const dotClass = online ? "ok" : seen ? "warn" : "ng";
+    const state = online ? "接続中" : seen ? "発見済み" : "オフライン";
+    const score = Math.round(reputation.scoreOf(peer.node_id));
+    const banned = reputation.isBanned(peer.node_id);
+    const verified = members.has(peer.node_id) && !config?.open
+      ? `<span class="badge ok-badge">✓</span>`
+      : "";
+    const trust = banned
+      ? `<span class="badge ng-text">遮断</span>`
+      : score !== 0
+        ? `<span class="badge">信頼 ${score}</span>`
         : "";
-      return `<li><b>${escapeHtml(nicknameOf(peer.node_id))}</b> <code>${short(peer.node_id)}</code> ${state} ${verified} ${trust} ${reset}</li>`;
-    });
-  $("peer-list").innerHTML = rows.join("") || `<li class="muted">他の参加者はまだいません</li>`;
+    return `<li>${avatarHtml(peer.node_id)}
+      <div class="m-main">
+        <div class="m-name">${escapeHtml(nicknameOf(peer.node_id))}</div>
+        <div class="m-sub"><span class="dot ${dotClass}" style="width:7px;height:7px"></span>${state} ${verified} ${trust}</div>
+      </div>
+      ${score !== 0 ? `<button class="btn small trust-reset" data-id="${escapeHtml(peer.node_id)}">リセット</button>` : ""}
+    </li>`;
+  });
+  $("member-list").innerHTML = rows.join("") || `<li class="muted">まだ他の参加者がいません</li>`;
   $("peer-count").textContent = String(connected.size);
-  for (const btn of $("peer-list").querySelectorAll<HTMLButtonElement>(".trust-reset")) {
+  for (const btn of $("member-list").querySelectorAll<HTMLButtonElement>(".trust-reset")) {
     btn.onclick = () => {
       const id = btn.dataset["id"]!;
       reputation.reset(id);
       void store.delete("peers", id);
       renderPeers();
-      toast("信頼スコアをリセットしました", "ok");
     };
   }
 }
 
+let lastChatCount = 0;
 function renderChat(): void {
   if (!chatLog) return;
-  const rows = chatLog
-    .ordered()
-    .filter((entry) => entry.kind === "chat" || entry.kind === "file")
-    .map((entry) => {
-      const originNode = replicaNodeId(entry.origin);
-      const mine = originNode === myNodeId;
-      const time = new Date(entry.ts * 1000).toLocaleTimeString();
-      const who = escapeHtml(nicknameOf(originNode));
-      if (entry.kind === "file") {
-        // defensive: a malformed persisted entry must not break rendering
-        const meta = (entry.data ?? {}) as Partial<FileMeta>;
-        const cid = escapeHtml(String(meta.cid ?? ""));
-        const busy = downloading.has(String(meta.cid));
-        return `<div class="msg ${mine ? "mine" : ""}">
-          <span class="who">${who}</span>
-          <span class="file-chip" data-cid="${cid}">
-            📄 ${escapeHtml(String(meta.name ?? "file"))} <span class="muted">(${humanSize(Number(meta.size) || 0)})</span>
-            <button class="mini file-dl" data-cid="${cid}" ${busy ? "disabled" : ""}>
-              ${busy ? "取得中…" : "取得"}
-            </button>
-          </span>
-          <span class="time">${time}</span></div>`;
-      }
-      const data = entry.data as { text?: string };
-      return `<div class="msg ${mine ? "mine" : ""}"><span class="who">${who}</span><span class="text">${escapeHtml(
-        String(data?.text ?? ""),
-      )}</span><span class="time">${time}</span></div>`;
-    });
   const box = $("chat-box");
-  // only auto-scroll when the user was already reading the newest messages
-  const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 48;
-  box.innerHTML = rows.join("") || `<div class="muted">まだメッセージはありません</div>`;
+  const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 60;
+  const entries = chatLog.ordered().filter((e) => e.kind === "chat" || e.kind === "file");
+  const rows = entries.map((entry) => {
+    const originNode = replicaNodeId(entry.origin);
+    const mine = originNode === myNodeId;
+    const time = new Date(entry.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    let inner: string;
+    if (entry.kind === "file") {
+      const meta = (entry.data ?? {}) as Partial<FileMeta>;
+      const cid = String(meta.cid ?? "");
+      const busy = downloading.has(cid);
+      inner = `<span class="file-chip" data-cid="${escapeHtml(cid)}">📄
+        <span class="fname">${escapeHtml(String(meta.name ?? "file"))}</span>
+        <span class="muted">${humanSize(Number(meta.size) || 0)}</span>
+        <button class="btn small file-dl" data-cid="${escapeHtml(cid)}" ${busy ? "disabled" : ""}>${busy ? "取得中" : "取得"}</button>
+      </span>`;
+    } else {
+      const data = entry.data as { text?: string };
+      inner = `<div class="bubble">${escapeHtml(String(data?.text ?? ""))}</div>`;
+    }
+    return `<div class="msg ${mine ? "me" : ""}">
+      ${avatarHtml(originNode)}
+      <div class="bubble-wrap">
+        <div class="who">${escapeHtml(nicknameOf(originNode))}</div>
+        ${inner}
+        <div class="time">${time}</div>
+      </div>
+    </div>`;
+  });
+  box.innerHTML = rows.join("") || `<div class="empty">まだメッセージはありません。<br>最初のひとことを送ってみましょう 👋</div>`;
   for (const btn of box.querySelectorAll<HTMLButtonElement>(".file-dl")) {
     btn.onclick = () => {
       const cid = btn.dataset["cid"]!;
@@ -1463,72 +1445,106 @@ function renderChat(): void {
       if (entry) void downloadFile(entry.data as FileMeta);
     };
   }
-  if (wasAtBottom) box.scrollTop = box.scrollHeight;
+  if (wasAtBottom || entries.length !== lastChatCount) box.scrollTop = box.scrollHeight;
+  lastChatCount = entries.length;
 }
 
 function renderNs(): void {
   if (!nameService) return;
-  const rows = nameService.all().map(
-    (record) => `
-      <tr>
-        <td><code>${escapeHtml(record.name)}</code></td>
-        <td><code>${escapeHtml(JSON.stringify(record.value))}</code></td>
-        <td>${record.version}</td>
-        <td>${record.ttl}s</td>
-        <td><code>${short(record.author_pubkey)}</code></td>
-      </tr>`,
-  );
-  $("ns-body").innerHTML =
-    rows.join("") || `<tr><td colspan="5" class="muted">レコードはまだありません</td></tr>`;
+  const rows = nameService
+    .all()
+    .filter((r) => !r.name.startsWith(REVOKED_PREFIX))
+    .map(
+      (r) =>
+        `<tr><td><code>${escapeHtml(r.name)}</code></td><td><code>${escapeHtml(JSON.stringify(r.value))}</code></td><td>${r.version}</td></tr>`,
+    );
+  $("ns-body").innerHTML = rows.join("") || `<tr><td colspan="3" class="muted">なし</td></tr>`;
 }
 
 function renderInvites(): void {
   const list = $("issued-list");
-  if (issuedInvites.length === 0) {
+  if (!issuedInvites.length) {
     list.innerHTML = "";
     return;
   }
   list.innerHTML = issuedInvites
     .map((inv) => {
       const state = inv.revoked
-        ? `<span class="badge">失効済み</span>`
-        : `<button class="mini danger revoke-btn" data-id="${escapeHtml(inv.invite_id)}">失効</button>`;
-      return `<li><code>${escapeHtml(inv.invite_id)}</code>
-        <span class="muted small">→ ${short(inv.subject_pubkey)} [${inv.rights.join(",")}]</span> ${state}</li>`;
+        ? `<span class="badge">失効</span>`
+        : `<button class="btn small danger revoke-btn" data-id="${escapeHtml(inv.invite_id)}">失効</button>`;
+      return `<li><code>${escapeHtml(inv.invite_id)}</code> <span class="muted small">${short(inv.subject_pubkey)}</span> ${state}</li>`;
     })
     .join("");
   for (const btn of list.querySelectorAll<HTMLButtonElement>(".revoke-btn")) {
     btn.onclick = () => {
-      if (confirm(`招待 ${btn.dataset["id"]} を失効させますか?\n(この招待で参加した全ノードが切断されます)`)) {
-        void revokeInvite(btn.dataset["id"]!).catch((err) => toast((err as Error).message, "error"));
+      if (confirm(`招待 ${btn.dataset["id"]} を失効させますか?`)) {
+        void revokeInvite(btn.dataset["id"]!).catch((e) => toast((e as Error).message, "error"));
       }
     };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Boot + UI wiring
+// Room switching / sharing
 // ---------------------------------------------------------------------------
+
+function roomLink(room: string): string {
+  if (!location.protocol.startsWith("http")) return "";
+  return `${location.origin}${location.pathname}#room=${encodeURIComponent(room)}`;
+}
+
+async function switchRoom(room: string): Promise<void> {
+  const roomName = normalizeRoom(room);
+  if (!roomName) throw new Error("ルーム名を入力してください");
+  if (config?.open && config.room === roomName) return;
+  const relays = config?.relays ?? defaultRelays();
+  const nickname = config?.nickname ?? autoNickname();
+  // tear down current node, then join the new room
+  if (config) await leaveNetwork(true);
+  history.replaceState(null, "", `#room=${encodeURIComponent(roomName)}`);
+  await joinRoom(roomName, nickname, relays);
+}
+
+// ---------------------------------------------------------------------------
+// Boot + wiring
+// ---------------------------------------------------------------------------
+
+function autoNickname(): string {
+  return `guest-${randomHex(2)}`;
+}
+
+function urlRoom(): string | undefined {
+  const h = /[#&]room=([^&]+)/.exec(location.hash);
+  if (h) return decodeURIComponent(h[1]!);
+  const q = new URLSearchParams(location.search).get("room");
+  return q ?? undefined;
+}
 
 async function boot(): Promise<void> {
   config = await store.get<NodeConfig>("kv", "config");
+
+  // invite link takes priority: prefill the welcome invite box
+  const inviteHash = /#invite=([A-Za-z0-9_-]+)/.exec(location.hash);
+
   if (!config) {
-    $("setup").hidden = false;
-    $("main").hidden = true;
-    // prefill the relay box with the default for THIS origin, so a user on a
-    // tunnel/https deploy gets the correct wss:// relay automatically
-    const relayBox = $("create-relays") as HTMLTextAreaElement;
-    if (!relayBox.value.trim()) relayBox.value = defaultRelays().join("\n");
-    applyInviteHash();
+    // first run: show the welcome chooser, prefilled and one tap to join
+    const nick = $("welcome-nick") as HTMLInputElement;
+    const room = $("welcome-room") as HTMLInputElement;
+    if (!nick.value) nick.value = autoNickname();
+    if (!room.value) room.value = urlRoom() ?? "lobby";
+    if (inviteHash) {
+      ($("welcome-bundle") as HTMLTextAreaElement).value = inviteHash[1]!;
+      ($("welcome-advanced") as HTMLElement).hidden = false;
+      toast("招待リンクを検出。詳細設定から参加してください", "info");
+    }
+    $("welcome").hidden = false;
+    $("app").hidden = true;
     return;
   }
-  if (/#invite=/.test(location.hash)) {
-    toast("このブラウザは既にネットワークに参加済みのため、招待リンクは使えません。別プロファイルで開くか identity を削除してください", "info");
-    history.replaceState(null, "", location.pathname);
-  }
+
   nodeStoredKeys = await store.get<StoredKeyPair>("kv", "nodeKeys");
   if (!nodeStoredKeys) {
-    $("setup").hidden = false;
+    $("welcome").hidden = false;
     return;
   }
   nodeKeys = await importKeyPair(nodeStoredKeys);
@@ -1537,24 +1553,6 @@ async function boot(): Promise<void> {
   inviteChain = (await store.get<InviteCertificate[]>("kv", "inviteChain")) ?? [];
   issuedInvites = (await store.get<IssuedInvite[]>("kv", "issuedInvites")) ?? [];
   await startNode();
-}
-
-/** #invite=… in the URL prefills the join form (invite links). */
-function applyInviteHash(): void {
-  const match = /#invite=([A-Za-z0-9_-]+)/.exec(location.hash);
-  if (!match) return;
-  ($("join-bundle") as HTMLTextAreaElement).value = match[1]!;
-  $("join-card").scrollIntoView({ behavior: "smooth" });
-  void store.get<StoredKeyPair>("kv", "pendingKeys").then((pending) => {
-    if (pending) {
-      toast("招待リンクを検出しました。ニックネームを入れて参加してください", "info");
-    } else {
-      toast(
-        "招待リンクを検出しました。この招待があなたの参加リクエストコード宛でない場合は参加できません — 先に手順1でコードを作り、招待者に渡してください",
-        "info",
-      );
-    }
-  });
 }
 
 function busyWrap(btn: HTMLButtonElement, fn: () => Promise<void>): void {
@@ -1571,130 +1569,109 @@ function busyWrap(btn: HTMLButtonElement, fn: () => Promise<void>): void {
   };
 }
 
+function openDrawer(open: boolean): void {
+  $("drawer").hidden = !open;
+  $("drawer-scrim").hidden = !open;
+  if (open) renderAll();
+}
+
 function wireUi(): void {
-  busyWrap($("btn-create") as HTMLButtonElement, async () => {
-    const nickname = ($("create-nickname") as HTMLInputElement).value.trim() || "creator";
-    const relays = ($("create-relays") as HTMLTextAreaElement).value
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    await createNetwork(nickname, relays.length ? relays : defaultRelays());
+  // ---- welcome ----
+  busyWrap($("btn-welcome-join") as HTMLButtonElement, async () => {
+    const nick = ($("welcome-nick") as HTMLInputElement).value.trim() || autoNickname();
+    const room = ($("welcome-room") as HTMLInputElement).value.trim() || "lobby";
+    const relays = parseRelays(($("welcome-relays") as HTMLTextAreaElement).value);
+    history.replaceState(null, "", `#room=${encodeURIComponent(normalizeRoom(room))}`);
+    await joinRoom(room, nick, relays);
   });
 
-  busyWrap($("btn-request") as HTMLButtonElement, async () => {
+  $("btn-welcome-advanced").onclick = () => {
+    const adv = $("welcome-advanced");
+    adv.hidden = !adv.hidden;
+  };
+
+  busyWrap($("btn-welcome-create") as HTMLButtonElement, async () => {
+    const nick = ($("welcome-nick") as HTMLInputElement).value.trim() || autoNickname();
+    const relays = parseRelays(($("welcome-relays") as HTMLTextAreaElement).value);
+    await createNetwork(nick, relays);
+  });
+
+  busyWrap($("btn-welcome-request") as HTMLButtonElement, async () => {
     const code = await prepareJoinRequest();
-    const out = $("request-code") as HTMLTextAreaElement;
+    const out = $("welcome-request-out") as HTMLTextAreaElement;
     out.value = code;
     out.hidden = false;
-    $("request-hint").hidden = false;
+    await copy(code, "参加コードをコピーしました");
   });
 
-  // --- offline (relay-less) connection ---
-  busyWrap($("btn-off-request") as HTMLButtonElement, async () => {
-    const code = await prepareJoinRequest();
-    const out = $("off-request-out") as HTMLTextAreaElement;
-    out.value = code;
-    out.hidden = false;
-    $("off-request-hint").hidden = false;
+  busyWrap($("btn-welcome-acceptinvite") as HTMLButtonElement, async () => {
+    const bundle = ($("welcome-bundle") as HTMLTextAreaElement).value.trim();
+    const nick = ($("welcome-nick") as HTMLInputElement).value.trim() || autoNickname();
+    if (!bundle) throw new Error("招待コードを貼り付けてください");
+    await acceptInvite(bundle, nick);
   });
 
-  busyWrap($("btn-off-answer") as HTMLButtonElement, async () => {
-    const offer = ($("off-offer-in") as HTMLTextAreaElement).value.trim();
-    const nickname = ($("off-nickname") as HTMLInputElement).value.trim() || "member";
-    if (!offer) throw new Error("オファーを貼り付けてください");
-    const answer = await offlineAcceptOffer(offer, nickname);
-    // #main is now shown (joined); surface the answer there and here
-    const out = $("off-answer-out") as HTMLTextAreaElement;
-    out.value = answer;
-    out.hidden = false;
-    $("off-answer-hint").hidden = false;
-    await navigator.clipboard?.writeText(answer).catch(() => {});
-  });
-
-  busyWrap($("btn-off-offer") as HTMLButtonElement, async () => {
-    const subject = ($("off-subject") as HTMLInputElement).value.trim();
-    const grant = ($("off-grant") as HTMLInputElement).checked;
-    const offer = await offlineCreateOffer(subject, grant);
-    const out = $("off-offer-out") as HTMLTextAreaElement;
-    out.value = offer;
-    out.hidden = false;
-    await navigator.clipboard?.writeText(offer).catch(() => {});
-  });
-
-  busyWrap($("btn-off-complete") as HTMLButtonElement, async () => {
-    const answer = ($("off-answer-in") as HTMLTextAreaElement).value.trim();
-    if (!answer) throw new Error("アンサーを貼り付けてください");
-    await offlineAcceptAnswer(answer);
-  });
-
-  busyWrap($("btn-join") as HTMLButtonElement, async () => {
-    const bundle = ($("join-bundle") as HTMLTextAreaElement).value;
-    const nickname = ($("join-nickname") as HTMLInputElement).value.trim() || "member";
-    await acceptInvite(bundle, nickname);
-  });
-
-  busyWrap($("btn-import") as HTMLButtonElement, async () => {
-    const text = ($("import-json") as HTMLTextAreaElement).value.trim();
-    if (!text) throw new Error("identity JSON を貼り付けてください");
+  busyWrap($("btn-welcome-import") as HTMLButtonElement, async () => {
+    const text = ($("welcome-import") as HTMLTextAreaElement).value.trim();
+    if (!text) throw new Error("JSON を貼り付けてください");
     await importIdentity(text);
   });
 
-  $("btn-copy-url").onclick = async () => {
-    if (!config) return;
-    try {
-      await navigator.clipboard.writeText(anpUrl(config.network_id));
-      toast("URLをコピーしました", "ok");
-    } catch {
-      toast("コピーできませんでした (手動で選択してください)", "error");
-    }
-  };
+  // ---- topbar / drawer ----
+  $("btn-menu").onclick = () => openDrawer(true);
+  $("btn-drawer-close").onclick = () => openDrawer(false);
+  $("drawer-scrim").onclick = () => openDrawer(false);
+  $("btn-share").onclick = () => void shareRoom();
 
-  busyWrap($("btn-issue") as HTMLButtonElement, async () => {
-    const pubkey = ($("invite-pubkey") as HTMLInputElement).value.trim();
-    const grantInvite = ($("invite-grant") as HTMLInputElement).checked;
-    const { bundle, link } = await issueInvite(pubkey, grantInvite);
-    const out = $("invite-bundle") as HTMLTextAreaElement;
-    out.value = bundle;
-    out.hidden = false;
-    const linkRow = $("invite-link-row");
-    linkRow.hidden = !link;
-    if (link) ($("invite-link") as HTMLInputElement).value = link;
-    toast("招待バンドルを発行しました", "ok");
-  });
-
-  $("btn-copy-invite-link").onclick = async () => {
-    const link = ($("invite-link") as HTMLInputElement).value;
-    if (!link) return;
-    try {
-      await navigator.clipboard.writeText(link);
-      toast("招待リンクをコピーしました", "ok");
-    } catch {
-      toast("コピーできませんでした (手動で選択してください)", "error");
-    }
-  };
-
+  // ---- composer ----
   const chatInput = $("chat-input") as HTMLInputElement;
-  $("btn-send").onclick = () => {
+  ($("composer") as HTMLFormElement).onsubmit = (ev) => {
+    ev.preventDefault();
     const text = chatInput.value.trim();
     if (!text) return;
     chatInput.value = "";
     void sendChat(text);
   };
-  chatInput.onkeydown = (ev) => {
-    // never send while the IME is composing (Japanese input Enter = confirm)
+  chatInput.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.isComposing && ev.keyCode !== 229) {
-      ($("btn-send") as HTMLButtonElement).click();
+      ev.preventDefault();
+      ($("composer") as HTMLFormElement).requestSubmit();
     }
-  };
+  });
 
   const fileInput = $("file-input") as HTMLInputElement;
   $("btn-file").onclick = () => fileInput.click();
   fileInput.onchange = () => {
     const file = fileInput.files?.[0];
     fileInput.value = "";
-    if (file) void shareFile(file).catch((err) => toast((err as Error).message, "error"));
+    if (file) void shareFile(file).catch((e) => toast((e as Error).message, "error"));
   };
 
+  // ---- drawer: identity ----
+  busyWrap($("btn-save-nick") as HTMLButtonElement, async () => {
+    const nick = ($("d-nick") as HTMLInputElement).value.trim();
+    if (!nick) throw new Error("ニックネームを入力してください");
+    await setNickname(nick);
+    toast("ニックネームを更新しました", "ok");
+  });
+
+  // ---- drawer: rooms ----
+  busyWrap($("btn-join-room") as HTMLButtonElement, async () => {
+    const room = ($("d-room") as HTMLInputElement).value.trim();
+    await switchRoom(room);
+    ($("d-room") as HTMLInputElement).value = "";
+    openDrawer(false);
+  });
+  $("btn-copy-link").onclick = () => {
+    if (config?.open && config.room) void copy(roomLink(config.room), "共有リンクをコピーしました");
+    else void copy(anpUrl(config?.network_id ?? ""), "URLをコピーしました");
+  };
+  busyWrap($("btn-new-room") as HTMLButtonElement, async () => {
+    await switchRoom(`room-${randomHex(3)}`);
+    openDrawer(false);
+  });
+
+  // ---- drawer: NS ----
   busyWrap($("btn-ns-publish") as HTMLButtonElement, async () => {
     const name = ($("ns-name") as HTMLInputElement).value.trim();
     const value = ($("ns-value") as HTMLInputElement).value.trim();
@@ -1703,6 +1680,22 @@ function wireUi(): void {
     toast(`${name} を公開しました`, "ok");
   });
 
+  // ---- drawer: invite ----
+  busyWrap($("btn-issue") as HTMLButtonElement, async () => {
+    const pubkey = ($("invite-pubkey") as HTMLInputElement).value.trim();
+    const grant = ($("invite-grant") as HTMLInputElement).checked;
+    const { bundle, link } = await issueInvite(pubkey, grant);
+    const out = $("invite-bundle") as HTMLTextAreaElement;
+    out.value = bundle;
+    out.hidden = false;
+    const row = $("invite-link-row");
+    row.hidden = !link;
+    if (link) ($("invite-link") as HTMLInputElement).value = link;
+    await copy(link || bundle, "招待をコピーしました");
+  });
+  $("btn-copy-invite-link").onclick = () => void copy(($("invite-link") as HTMLInputElement).value, "コピーしました");
+
+  // ---- drawer: relays ----
   busyWrap($("btn-relay-add") as HTMLButtonElement, async () => {
     const input = $("relay-add-url") as HTMLInputElement;
     const url = input.value.trim();
@@ -1711,59 +1704,85 @@ function wireUi(): void {
     input.value = "";
   });
 
+  // ---- drawer: data ----
   busyWrap($("btn-export") as HTMLButtonElement, () => exportIdentity());
-  $("btn-leave").onclick = () => void leaveNetwork();
+  $("btn-leave").onclick = () => void leaveNetwork().then(() => location.reload());
   $("btn-reset").onclick = () => {
-    if (confirm("鍵・履歴・ネットワーク設定をすべて削除します。よろしいですか?")) void resetIdentity();
+    if (confirm("鍵・履歴をすべて削除します。よろしいですか?")) void resetIdentity();
   };
 
-  // best-effort LEAVE on tab close; heartbeat TTL covers the rest
   window.addEventListener("pagehide", sendLeaveBeacon);
   window.addEventListener("beforeunload", sendLeaveBeacon);
-  window.addEventListener("hashchange", () => {
-    if (!config) applyInviteHash();
-  });
+}
+
+function parseRelays(text: string): string[] {
+  return text.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+async function setNickname(nick: string): Promise<void> {
+  if (!config || !nodeKeys || !profileMap) return;
+  config.nickname = nick;
+  await store.put("kv", "config", config);
+  const key = `nickname/${myNodeId}`;
+  const cell = profileMap.set(key, nick);
+  await signCell(nodeKeys.privateKey, nodeKeys.publicKeyHex, key, cell);
+  await persistProfile();
+  mesh?.broadcast({ t: "PROFILE_DELTA", cells: { [key]: profileMap.getCell(key)! } });
+  void refreshJoin(true);
+  renderChat();
+  renderPeers();
+}
+
+async function shareRoom(): Promise<void> {
+  if (!config) return;
+  const link = config.open && config.room ? roomLink(config.room) : anpUrl(config.network_id);
+  const shareData = { title: "ANP", text: `ANPルーム #${config.room ?? ""} に参加しよう`, url: link || undefined };
+  if (navigator.share && link) {
+    try {
+      await navigator.share(shareData);
+      return;
+    } catch {
+      /* fall through to copy */
+    }
+  }
+  await copy(link || anpUrl(config.network_id), "共有リンクをコピーしました");
+}
+
+async function copy(text: string, okMsg: string): Promise<void> {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMsg, "ok");
+  } catch {
+    toast("コピーできませんでした", "error");
+  }
 }
 
 /** Fatal, user-visible startup failure (never a silent blank page). */
 function fatal(message: string): void {
-  document.body.innerHTML = `
-    <div class="card" style="margin-top:15vh">
-      <h2>起動できません</h2>
-      <p>${escapeHtml(message)}</p>
-    </div>`;
+  document.body.innerHTML = `<div class="overlay"><div class="welcome-card"><h2>起動できません</h2><p class="muted">${escapeHtml(
+    message,
+  )}</p></div></div>`;
 }
 
-/**
- * Enforce a single active tab per browser profile. Two tabs would run the
- * same node identity (same keys, same CRDT epoch) concurrently and corrupt
- * the log with colliding entry ids. Uses the Web Locks API; the lock is held
- * until the tab closes.
- */
+/** One active tab per profile: two tabs would corrupt the shared CRDT. */
 function acquireSingleTabLock(): Promise<boolean> {
-  if (!("locks" in navigator)) return Promise.resolve(true); // very old browser: best effort
+  if (!("locks" in navigator)) return Promise.resolve(true);
   return new Promise((resolve) => {
     void navigator.locks.request("anp-node", { ifAvailable: true }, async (lock) => {
       resolve(lock !== null);
-      if (lock) await new Promise(() => {}); // hold forever (released on tab close)
+      if (lock) await new Promise(() => {});
     });
   });
 }
 
 void (async () => {
-  // Web Crypto is mandatory (signing/keys). It IS available in file:// secure
-  // contexts, so opening the downloaded HTML directly works. IndexedDB is NOT
-  // mandatory — AnpStore falls back to in-memory when it's unavailable.
   if (!globalThis.crypto?.subtle) {
-    fatal(
-      "このアプリには Web Crypto が必要です。ブラウザで直接ファイルを開くか、HTTPS/localhost で開いてください（古いブラウザや非対応環境では動作しません）。",
-    );
+    fatal("このブラウザは Web Crypto に対応していません。最新のブラウザで開いてください。");
     return;
   }
   if (!(await acquireSingleTabLock())) {
-    fatal(
-      "ANP は既に別のタブで実行中です。同じ identity を2つ同時に動かすとデータが壊れるため、このタブでは起動しません。別ノードを試すには別のブラウザプロファイルを使ってください。",
-    );
+    fatal("別のタブで ANP が起動中です。このタブは同時実行を避けるため停止しました。");
     return;
   }
   try {
@@ -1771,10 +1790,7 @@ void (async () => {
     wireUi();
     await boot();
     if (store.ephemeral) {
-      toast(
-        "永続化が使えない環境です（file:// など）。動作はしますが、リロードすると鍵・履歴は消えます。identity のエクスポートで保存できます。",
-        "info",
-      );
+      toast("この環境では履歴が保存されません（リロードで消えます）。", "info");
     }
   } catch (err) {
     fatal(`初期化に失敗しました: ${(err as Error).message}`);

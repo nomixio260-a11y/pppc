@@ -83,12 +83,16 @@ export interface EventBase {
 export interface JoinBody {
   proto: number;
   transport: { kind: "webrtc" };
-  /** invite chain, rooted at the genesis key; empty only for the genesis node itself */
+  /** invite chain, rooted at the genesis key; empty for open rooms / genesis */
   invite_chain: InviteCertificate[];
   /** ground nonce making the event id satisfy the network's PoW target */
   pow_nonce: string;
   /** human-readable display name (authenticated by the event signature) */
   nickname?: string;
+  /** open-room join: no invite chain required (default discovery mode) */
+  open?: boolean;
+  /** room name; when open, network_id must equal openNetworkId(room) */
+  room?: string;
 }
 
 export interface ManifestBody {

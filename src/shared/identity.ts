@@ -35,6 +35,28 @@ import type {
 /** Hard cap on invite-chain length (verification CPU bound). */
 export const MAX_CHAIN_LENGTH = 16;
 
+/**
+ * Open rooms (default mode): a public network anyone can join by knowing the
+ * room name — no genesis key, no invite chain. The network id is bound to the
+ * room name so an "open" join can never target an invite-only network.
+ *
+ *   room name -> SHA-256("anp-open-v1:" + room) -> Network ID
+ *
+ * Sybil resistance comes from JOIN proof-of-work and the local trust score;
+ * message authenticity from per-entry signatures.
+ */
+export const OPEN_PREFIX = "anp-open-v1:";
+
+export async function openNetworkId(room: string): Promise<NetworkId> {
+  return sha256Hex(utf8Encode(OPEN_PREFIX + room));
+}
+
+/** Normalize a room name (trim, lowercase, collapse spaces) so casing/spacing
+ * variants resolve to the same room. */
+export function normalizeRoom(room: string): string {
+  return room.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 64);
+}
+
 export async function networkIdFromGenesisPubkey(genesisPubkeyHex: PubKeyHex): Promise<NetworkId> {
   return sha256Hex(hexToBytes(genesisPubkeyHex));
 }
