@@ -172,7 +172,10 @@ class EventStore {
           dropped++;
         }
       }
-      if (bucket.size === 0) this.networks.delete(networkId);
+      if (bucket.size === 0) {
+        this.networks.delete(networkId);
+        this.activity.delete(networkId);
+      }
     }
     for (const [networkId, nodes] of this.joinIndex) {
       for (const [nodeId, expiry] of nodes) {
@@ -189,16 +192,35 @@ class EventStore {
     return { networks: this.networks.size, events };
   }
 
+  /**
+   * Fair eviction: drop the oldest event belonging to whichever node holds
+   * the MOST events in this network. A global-oldest policy would let a few
+   * chatty (or malicious) nodes push everyone else's discovery events out;
+   * targeting the heaviest node gives max-min fairness across members.
+   */
   private evictOldest(bucket: Map<string, AnpEvent>): void {
-    let oldestId: string | undefined;
-    let oldestAt = Infinity;
-    for (const [id, event] of bucket) {
-      if (event.created_at < oldestAt) {
-        oldestAt = event.created_at;
-        oldestId = id;
+    const counts = new Map<string, number>();
+    for (const event of bucket.values()) {
+      counts.set(event.node_id, (counts.get(event.node_id) ?? 0) + 1);
+    }
+    let heaviest: string | undefined;
+    let max = 0;
+    for (const [nodeId, n] of counts) {
+      if (n > max) {
+        max = n;
+        heaviest = nodeId;
       }
     }
-    if (oldestId) bucket.delete(oldestId);
+    let victimId: string | undefined;
+    let oldestAt = Infinity;
+    for (const [id, event] of bucket) {
+      if (event.node_id !== heaviest) continue;
+      if (event.created_at < oldestAt) {
+        oldestAt = event.created_at;
+        victimId = id;
+      }
+    }
+    if (victimId) bucket.delete(victimId);
   }
 }
 

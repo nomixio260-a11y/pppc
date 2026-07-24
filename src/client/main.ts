@@ -57,7 +57,13 @@ import {
   type LogEntry,
   type LwwCell,
 } from "../shared/crdt.js";
-import { NameServiceStore, REVOKED_PREFIX, createNameRecord } from "../shared/nameservice.js";
+import {
+  NameServiceStore,
+  REVOKED_PREFIX,
+  createNameRecord,
+  isValidRevocationRecord,
+  revocationName,
+} from "../shared/nameservice.js";
 import type {
   AnpEvent,
   FileMeta,
@@ -175,11 +181,31 @@ let timers: number[] = [];
 const members = new Map<NodeId, MemberRecord>();
 /** chat entries whose origin membership is not yet proven (keyed by node id) */
 const pendingEntries = new Map<NodeId, { entries: LogEntry[]; since: number }>();
+let pendingEntryTotal = 0;
 const MAX_PENDING = 500;
+const MAX_PENDING_ORIGINS = 64;
+const MAX_ENTRIES_PER_DELTA = 512;
 /** origins we've already asked a proof for recently */
 const proofRequested = new Map<NodeId, number>();
+const MAX_PROOF_REQUESTED = 256;
 /** interval for periodic anti-entropy with a random connected peer */
 const ANTI_ENTROPY_MS = 60_000;
+
+/** Evict the pending-origin bucket that has waited longest (bounded memory). */
+function evictOldestPending(): void {
+  let oldest: NodeId | undefined;
+  let oldestAt = Infinity;
+  for (const [nodeId, p] of pendingEntries) {
+    if (p.since < oldestAt) {
+      oldestAt = p.since;
+      oldest = nodeId;
+    }
+  }
+  if (oldest) {
+    pendingEntryTotal -= pendingEntries.get(oldest)!.entries.length;
+    pendingEntries.delete(oldest);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Persistence
@@ -248,6 +274,7 @@ function flushPending(origin: NodeId): void {
   const pending = pendingEntries.get(origin);
   if (!pending || !chatLog) return;
   pendingEntries.delete(origin);
+  pendingEntryTotal -= pending.entries.length;
   const added = chatLog.merge(pending.entries);
   if (added.length) {
     void persistChat();
@@ -273,12 +300,41 @@ function isAuthorizedNsAuthor(pubkey: string): boolean {
   return false;
 }
 
+/**
+ * A pubkey plausibly authorized to publish a revocation: genesis, ourselves,
+ * any known member (live or historical), or any pubkey that appears as an
+ * issuer in a known member's invite chain (i.e. a real inviter, even one we've
+ * never connected to). Whether the revocation actually has effect is still
+ * decided by `isCertRevoked` (issuer/genesis only) — this bound only limits
+ * who may seed a stored `revoked/` record, keeping the namespace from being
+ * spammed by arbitrary throwaway keys while never dropping a genuine one.
+ */
+function isPlausibleRevoker(pubkey: string): boolean {
+  if (pubkey === genesisPubkeyHex() || pubkey === nodeKeys?.publicKeyHex) return true;
+  for (const member of members.values()) {
+    if (member.pubkey === pubkey) return true;
+    for (const cert of member.invite_chain) {
+      if (cert.issuer_pubkey === pubkey) return true;
+    }
+  }
+  return false;
+}
+
 async function mergeNsRecords(records: NameRecord[], from?: NodeId): Promise<boolean> {
   if (!nameService) return false;
   const merged: NameRecord[] = [];
   for (const record of records ?? []) {
     if (!record || typeof record.author_pubkey !== "string") continue;
-    if (!isAuthorizedNsAuthor(record.author_pubkey)) continue;
+    // Revocation records are gated by plausible-revoker (not live-membership),
+    // because a node may need to honor a revocation issued by an authority it
+    // has never verified as a live peer. Their real authority is enforced by
+    // isCertRevoked at chain-verification time; the structural validity
+    // (author binding, value shape) is enforced inside NameServiceStore.merge.
+    const isRevocation = record.name.startsWith(REVOKED_PREFIX);
+    const allowed = isRevocation
+      ? isValidRevocationRecord(record) && isPlausibleRevoker(record.author_pubkey)
+      : isAuthorizedNsAuthor(record.author_pubkey);
+    if (!allowed) continue;
     if (await nameService.merge(record)) merged.push(record);
   }
   if (merged.length) {
@@ -427,7 +483,9 @@ async function revokeInvite(inviteId: string): Promise<void> {
   if (!invite) throw new Error("unknown invite");
   const keys = invite.issued_by === "genesis" ? genesisKeys : nodeKeys;
   if (!keys) throw new Error("発行鍵がありません");
-  const name = `${REVOKED_PREFIX}${inviteId}`;
+  // per-author revocation slot: `revoked/<invite_id>/<my pubkey>`. Nobody can
+  // overwrite or forge another authority's slot (see nameservice.ts).
+  const name = revocationName(inviteId, keys.publicKeyHex);
   const existing = nameService.resolve(name);
   const record = await createNameRecord(
     config.network_id,
@@ -721,6 +779,17 @@ function sendHello(to: NodeId): void {
 function requestProof(origin: NodeId, from: NodeId): void {
   const last = proofRequested.get(origin) ?? 0;
   if (Date.now() - last < 10_000) return;
+  // bound the map: drop the oldest entries once it grows too large
+  if (proofRequested.size >= MAX_PROOF_REQUESTED) {
+    const cutoff = Date.now() - 10_000;
+    for (const [nodeId, ts] of proofRequested) {
+      if (ts < cutoff) proofRequested.delete(nodeId);
+    }
+    if (proofRequested.size >= MAX_PROOF_REQUESTED) {
+      const first = proofRequested.keys().next().value;
+      if (first) proofRequested.delete(first);
+    }
+  }
   proofRequested.set(origin, Date.now());
   mesh?.send(from, { t: "MEMBER_REQ", node_id: origin });
 }
@@ -748,8 +817,10 @@ function validEntryData(entry: LogEntry): boolean {
 
 async function acceptChatEntries(from: NodeId, entries: LogEntry[]): Promise<void> {
   if (!chatLog || !mesh) return;
+  // bound work per delta: a peer cannot force an unbounded ECDSA-verify storm
+  const batch = (entries ?? []).slice(0, MAX_ENTRIES_PER_DELTA);
   const mergeable: LogEntry[] = [];
-  for (const entry of entries ?? []) {
+  for (const entry of batch) {
     if (typeof entry?.id !== "string") continue;
     if (!validEntryData(entry)) continue; // malformed shape
     if (!(await verifyLogEntry(entry))) continue; // forged or unsigned
@@ -757,15 +828,20 @@ async function acceptChatEntries(from: NodeId, entries: LogEntry[]): Promise<voi
     if (originNode === myNodeId || members.has(originNode)) {
       mergeable.push(entry);
     } else {
-      // hold until the origin's membership is proven
+      // hold until the origin's membership is proven — but bound both the
+      // number of distinct unproven origins and the total buffered entries, so
+      // a peer streaming forged-origin (yet validly self-signed) entries can't
+      // exhaust memory
       let pending = pendingEntries.get(originNode);
       if (!pending) {
+        if (pendingEntries.size >= MAX_PENDING_ORIGINS) evictOldestPending();
         pending = { entries: [], since: Date.now() };
         pendingEntries.set(originNode, pending);
       }
-      let total = 0;
-      for (const p of pendingEntries.values()) total += p.entries.length;
-      if (total < MAX_PENDING) pending.entries.push(entry);
+      if (pendingEntryTotal < MAX_PENDING) {
+        pending.entries.push(entry);
+        pendingEntryTotal++;
+      }
       requestProof(originNode, from);
     }
   }

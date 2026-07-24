@@ -93,6 +93,9 @@ const PING_INTERVAL_MS = 15_000;
 const PONG_DEADLINE_MS = 50_000;
 const RETRY_BASE_MS = 4_000;
 const RETRY_MAX_MS = 60_000;
+/** upper bound on a single DataChannel frame; a base64 16 KiB blob chunk plus
+ * envelope fits well under this, so it only rejects abusive oversized frames */
+const MAX_DC_FRAME_BYTES = 512 * 1024;
 
 export class Mesh {
   /** peers known from discovery (valid JOIN seen) */
@@ -414,9 +417,11 @@ export class Mesh {
     };
     dc.onmessage = (ev) => {
       if (this.links.get(nodeId) !== link) return;
+      const raw = String(ev.data);
+      if (raw.length > MAX_DC_FRAME_BYTES) return; // oversized frame — drop
       let msg: DcMessage;
       try {
-        msg = JSON.parse(String(ev.data)) as DcMessage;
+        msg = JSON.parse(raw) as DcMessage;
       } catch {
         return; // malformed
       }

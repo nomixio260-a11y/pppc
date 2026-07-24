@@ -29,6 +29,8 @@ interface IncomingTransfer {
   received: number;
   total: number;
   size: number;
+  /** running total of bytes accepted, to cap memory amplification */
+  bytesSeen: number;
   resolve: (bytes: Uint8Array) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -97,6 +99,7 @@ export class FileService {
         received: 0,
         total: -1,
         size: 0,
+        bytesSeen: 0,
         resolve,
         reject,
         timer: setTimeout(() => {
@@ -168,6 +171,14 @@ export class FileService {
           transfer.reject(new Error("チャンクの復号失敗"));
           return true;
         }
+        // bound memory amplification: every chunk but the last must be exactly
+        // CHUNK_BYTES, and the running total may never exceed the announced
+        // size (itself capped at MAX_FILE_BYTES in BLOB_META)
+        if (bytes.length > CHUNK_BYTES || transfer.bytesSeen + bytes.length > transfer.size) {
+          transfer.reject(new Error("チャンクサイズ超過"));
+          return true;
+        }
+        transfer.bytesSeen += bytes.length;
         transfer.chunks[msg.idx] = bytes;
         transfer.received += 1;
         if (transfer.received === transfer.total) await this.finish(transfer);

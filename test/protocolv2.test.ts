@@ -24,7 +24,7 @@ import {
   verifyCell,
   verifyLogEntry,
 } from "../src/shared/crdt.js";
-import { NameServiceStore, REVOKED_PREFIX, createNameRecord } from "../src/shared/nameservice.js";
+import { NameServiceStore, createNameRecord, revocationName } from "../src/shared/nameservice.js";
 import { nodeIdFromPubkey } from "../src/shared/identity.js";
 import type { RevocationMap, SignalEvent } from "../src/shared/types.js";
 
@@ -279,13 +279,13 @@ test("a downstream chain is severed the instant a mid-chain revocation is known"
   );
 });
 
-test("revocation map is extracted from name-service records", async () => {
+test("revocation map is extracted from per-author name-service records", async () => {
   const { genesis, networkId, cert } = await makeMember();
   const store = new NameServiceStore(networkId);
   const record = await createNameRecord(
     networkId,
     genesis,
-    `${REVOKED_PREFIX}${cert.invite_id}`,
+    revocationName(cert.invite_id, genesis.publicKeyHex),
     { kind: "revocation", invite_id: cert.invite_id },
     1,
     3600,
@@ -294,15 +294,72 @@ test("revocation map is extracted from name-service records", async () => {
   const map = store.revocations();
   assert.ok(map.get(cert.invite_id)?.has(genesis.publicKeyHex));
 
-  // record with a mismatched name/invite_id is ignored
-  const bogus = await createNameRecord(
+  // a record whose name binds a different author than it is signed by is rejected
+  const forgedName = await createNameRecord(
     networkId,
     genesis,
-    `${REVOKED_PREFIX}other-id`,
+    revocationName(cert.invite_id, "0".repeat(130)), // claims author != genesis
     { kind: "revocation", invite_id: cert.invite_id },
+    5,
+    3600,
+  );
+  assert.equal(await store.merge(forgedName), false);
+
+  // a record whose value invite_id mismatches its name is rejected
+  const mismatch = await createNameRecord(
+    networkId,
+    genesis,
+    revocationName(cert.invite_id, genesis.publicKeyHex),
+    { kind: "revocation", invite_id: "other-id" },
+    9,
+    3600,
+  );
+  assert.equal(await store.merge(mismatch), false);
+});
+
+test("a member cannot un-revoke by squatting the revoked/ namespace (LWW-squat fix)", async () => {
+  // genesis revokes B; an unrelated member M tries to overwrite/suppress it.
+  const genesis = await generateKeyPair();
+  const member = await generateKeyPair();
+  const networkId = await networkIdFromGenesisPubkey(genesis.publicKeyHex);
+  const inviteId = "inv-target";
+  const store = new NameServiceStore(networkId);
+
+  const real = await createNameRecord(
+    networkId,
+    genesis,
+    revocationName(inviteId, genesis.publicKeyHex),
+    { kind: "revocation", invite_id: inviteId },
     1,
     3600,
   );
-  await store.merge(bogus);
-  assert.equal(store.revocations().size, 1);
+  assert.equal(await store.merge(real), true);
+  assert.ok(store.revocations().get(inviteId)?.has(genesis.publicKeyHex));
+
+  // (1) M tries to overwrite genesis's slot with a higher version — impossible,
+  // because the name binds the slot to genesis but the record is signed by M.
+  const squat = await createNameRecord(
+    networkId,
+    member,
+    revocationName(inviteId, genesis.publicKeyHex), // genesis's slot...
+    { kind: "revocation", invite_id: inviteId },
+    999, // ...higher version
+    3600,
+  );
+  assert.equal(await store.merge(squat), false, "cannot overwrite another author's slot");
+
+  // (2) M tries to plant a benign value at its OWN slot to suppress — the
+  // namespace only accepts real revocations, and merge keeps genesis's intact.
+  const benign = await createNameRecord(
+    networkId,
+    member,
+    revocationName(inviteId, member.publicKeyHex),
+    { kind: "node" },
+    999,
+    3600,
+  );
+  assert.equal(await store.merge(benign), false, "revoked/ namespace rejects non-revocations");
+
+  // genesis's revocation still stands
+  assert.ok(store.revocations().get(inviteId)?.has(genesis.publicKeyHex));
 });

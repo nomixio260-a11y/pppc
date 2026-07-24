@@ -13,10 +13,54 @@
  */
 
 import { type KeyPairHandle, nowSeconds, signObject, verifyObject } from "./crypto.js";
-import type { NameRecord, NetworkId, RevocationMap, RevocationValue } from "./types.js";
+import type { NameRecord, NetworkId, PubKeyHex, RevocationMap, RevocationValue } from "./types.js";
 
 /** Name prefix for invite-certificate revocations (protocol v2). */
 export const REVOKED_PREFIX = "revoked/";
+
+/**
+ * Canonical name for a revocation of `inviteId` published by `authorPubkey`.
+ *
+ * Revocation is a MULTI-AUTHOR, MONOTONIC set (any authorized revoker may add
+ * itself), so each (invite, author) pair gets its OWN name slot. This is the
+ * fix for the LWW-squatting bug: a plain `revoked/<id>` single record could be
+ * overwritten by any member with a higher version, silently un-revoking. With
+ * per-author names, a record can only occupy its own author's slot (enforced
+ * in `merge`), so no one can evict or forge another authority's revocation.
+ */
+export function revocationName(inviteId: string, authorPubkey: PubKeyHex): string {
+  return `${REVOKED_PREFIX}${inviteId}/${authorPubkey}`;
+}
+
+/**
+ * Parse a revocation name back into its (inviteId, authorPubkey) parts, or
+ * null if it is not a well-formed revocation name.
+ */
+export function parseRevocationName(name: string): { inviteId: string; authorPubkey: PubKeyHex } | null {
+  if (!name.startsWith(REVOKED_PREFIX)) return null;
+  const rest = name.slice(REVOKED_PREFIX.length);
+  const slash = rest.lastIndexOf("/");
+  if (slash <= 0 || slash === rest.length - 1) return null;
+  const inviteId = rest.slice(0, slash);
+  const authorPubkey = rest.slice(slash + 1);
+  if (!/^[0-9a-f]{130}$/.test(authorPubkey)) return null;
+  return { inviteId, authorPubkey };
+}
+
+/**
+ * A record under the `revoked/` namespace is only structurally valid when its
+ * name binds it to its own author and its value is a matching revocation. This
+ * makes the namespace forge-proof: a record can never occupy another author's
+ * slot, and the slot can only ever hold a real revocation (never a benign
+ * value that would suppress `revocations()`).
+ */
+export function isValidRevocationRecord(record: NameRecord): boolean {
+  const parts = parseRevocationName(record.name);
+  if (!parts) return false;
+  if (parts.authorPubkey !== record.author_pubkey) return false;
+  const value = record.value as RevocationValue;
+  return value?.kind === "revocation" && value.invite_id === parts.inviteId;
+}
 
 export async function createNameRecord(
   networkId: NetworkId,
@@ -68,6 +112,11 @@ export class NameServiceStore {
   async merge(record: NameRecord, now = nowSeconds()): Promise<boolean> {
     if (record.network_id !== this.networkId) return false;
     if (isExpired(record, now)) return false;
+    if (typeof record.name !== "string") return false;
+    // The `revoked/` namespace may ONLY ever hold author-bound revocation
+    // records — reject anything else, so a benign or forged value can never
+    // squat a revocation slot and suppress enforcement.
+    if (record.name.startsWith(REVOKED_PREFIX) && !isValidRevocationRecord(record)) return false;
     if (!(await verifyNameRecord(record))) return false;
     const current = this.records.get(record.name);
     // an expired stored record never beats a fresh incoming one — otherwise a
@@ -104,17 +153,17 @@ export class NameServiceStore {
   }
 
   /**
-   * Extract the revocation map from `revoked/<invite_id>` records. The map
-   * only carries who *claimed* each revocation; authority (issuer or genesis)
-   * is judged at chain-verification time by `isCertRevoked`.
+   * Extract the revocation map from `revoked/<invite_id>/<author>` records.
+   * Each valid record contributes its author to the invite's revoker set; the
+   * map only carries who *claimed* each revocation, and authority (issuer or
+   * genesis) is judged at chain-verification time by `isCertRevoked`.
    */
   revocations(now = nowSeconds()): RevocationMap {
     const map: RevocationMap = new Map();
     for (const record of this.all(now)) {
       if (!record.name.startsWith(REVOKED_PREFIX)) continue;
+      if (!isValidRevocationRecord(record)) continue;
       const value = record.value as RevocationValue;
-      if (value?.kind !== "revocation" || typeof value.invite_id !== "string") continue;
-      if (record.name !== `${REVOKED_PREFIX}${value.invite_id}`) continue;
       let revokers = map.get(value.invite_id);
       if (!revokers) {
         revokers = new Set();
