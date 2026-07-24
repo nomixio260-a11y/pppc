@@ -43,6 +43,21 @@
       <button id="btn-join" class="primary">2. 検証して参加</button>
     </div>
 
+    <div class="card" id="offline-join-card">
+      <h2>オフラインで参加 <span class="badge">サーバー不要</span></h2>
+      <p class="muted small">Relay を使わず、招待者とテキストを1往復コピペするだけで参加できます。ファイルを開いただけの状態で動きます。</p>
+      <button id="btn-off-request">① 参加コードを作成</button>
+      <textarea id="off-request-out" rows="2" readonly hidden></textarea>
+      <p id="off-request-hint" class="muted small" hidden>↑ これを招待者に渡す（秘密鍵はこのブラウザから出ません）</p>
+      <label>ニックネーム <input id="off-nickname" placeholder="member" /></label>
+      <label>② 招待者から受け取ったオファーを貼り付け
+        <textarea id="off-offer-in" rows="3" placeholder="オファー"></textarea>
+      </label>
+      <button id="btn-off-answer" class="primary">③ 参加してアンサーを作成</button>
+      <textarea id="off-answer-out" rows="3" readonly hidden placeholder="アンサー"></textarea>
+      <p id="off-answer-hint" class="muted small" hidden>↑ これを招待者に返すと接続完了</p>
+    </div>
+
     <div class="card">
       <h2>identity をインポート</h2>
       <p class="muted small">別ブラウザでエクスポートした identity JSON で同じノードとして復帰します。</p>
@@ -74,6 +89,21 @@
         <button id="btn-leave">LEAVE を送信して切断</button>
         <button id="btn-reset" class="danger">identity を完全削除</button>
       </div>
+    </div>
+
+    <div class="card" id="offline-invite-card">
+      <h2>オフラインで招待 <span class="badge">サーバー不要</span></h2>
+      <p class="muted small">Relay を使わず、テキストを1往復コピペするだけで相手と直接つながります。</p>
+      <label>① 相手の参加コードを貼り付け
+        <input id="off-subject" placeholder="相手の 04... コード" />
+      </label>
+      <label class="inline"><input type="checkbox" id="off-grant" /> 招待権も付与する</label>
+      <button id="btn-off-offer" class="primary">② オファーを作成</button>
+      <textarea id="off-offer-out" rows="3" readonly hidden placeholder="オファー"></textarea>
+      <label>③ 相手から返ってきたアンサーを貼り付け
+        <textarea id="off-answer-in" rows="3" placeholder="アンサー"></textarea>
+      </label>
+      <button id="btn-off-complete" class="primary">④ 接続を完了</button>
     </div>
 
     <div class="card" id="invite-card" hidden>

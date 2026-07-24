@@ -21,12 +21,15 @@
 import {
   type KeyPairHandle,
   type StoredKeyPair,
+  base64UrlDecode,
+  base64UrlEncode,
   exportKeyPair,
   generateKeyPair,
   importKeyPair,
   importPrivateKeyForEcdh,
   nowSeconds,
   randomHex,
+  utf8Encode,
 } from "../shared/crypto.js";
 import {
   anpUrl,
@@ -127,7 +130,9 @@ function defaultRelays(): string[] {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     return [`${proto}//${location.host}`];
   }
-  return ["ws://localhost:8787"];
+  // opened straight from a file:// — no server in sight; default to offline
+  // (relay-less). Users can still add a relay by hand, or use offline connect.
+  return [];
 }
 
 function relayHttpUrl(wsUrl: string): string {
@@ -171,6 +176,9 @@ let pool: RelayPool | undefined;
 let mesh: Mesh | undefined;
 let files: FileService | undefined;
 let reputation = new Reputation();
+/** offline joiner: keep the setup screen visible (to copy the answer) until
+ * the manual DataChannel actually opens */
+let deferMainView = false;
 let chatLog: GSetLog | undefined;
 let profileMap: LwwMap | undefined;
 let nameService: NameServiceStore | undefined;
@@ -464,29 +472,135 @@ async function acceptInvite(bundleText: string, nickname: string): Promise<void>
   await boot();
 }
 
-async function issueInvite(subjectPubkey: string, grantInvite: boolean): Promise<{ bundle: string; link: string }> {
-  if (!config || !nodeKeys) throw new Error("not joined");
+// ---------------------------------------------------------------------------
+// Offline / manual connection (no relay, no server)
+//
+// Two people exchange one text blob each way, over any channel (chat app,
+// email, QR). Works when the page is opened straight from a downloaded file.
+//   1. joiner  -> inviter : request code (joiner's public key)
+//   2. inviter -> joiner  : OFFER blob (invite chain + inviter identity + SDP)
+//   3. joiner  -> inviter : ANSWER blob (joiner identity + SDP)
+// After step 3 the DataChannel opens and the two nodes sync as usual.
+// ---------------------------------------------------------------------------
+
+interface OfferBlob {
+  v: 1;
+  t: "anp-offer";
+  network_id: string;
+  genesis_pubkey: string;
+  chain: InviteCertificate[];
+  from_node: string;
+  from_pubkey: string;
+  sdp: string;
+}
+
+interface AnswerBlob {
+  v: 1;
+  t: "anp-answer";
+  network_id: string;
+  from_node: string;
+  from_pubkey: string;
+  nickname?: string;
+  sdp: string;
+}
+
+function encodeBlob(value: unknown): string {
+  return base64UrlEncode(utf8Encode(JSON.stringify(value)));
+}
+function decodeBlob<T>(text: string): T {
+  return JSON.parse(new TextDecoder().decode(base64UrlDecode(text.trim()))) as T;
+}
+
+/** Inviter side: from the joiner's request code, issue an invite AND a manual
+ * WebRTC offer, bundled into one blob to hand back. */
+async function offlineCreateOffer(subjectPubkey: string, grantInvite: boolean): Promise<string> {
+  if (!config || !nodeKeys || !mesh) throw new Error("先にネットワークに参加してください");
   if (!/^[0-9a-f]{130}$/.test(subjectPubkey)) throw new Error("参加リクエストコードの形式が不正です");
+  const { chain } = await buildInviteChain(subjectPubkey, grantInvite);
+  const peerNode = await nodeIdFromPubkey(subjectPubkey);
+  const sdp = await mesh.manualCreateOffer(peerNode, subjectPubkey);
+  const blob: OfferBlob = {
+    v: 1,
+    t: "anp-offer",
+    network_id: config.network_id,
+    genesis_pubkey: genesisKeys?.publicKeyHex ?? inviteChain[0]!.issuer_pubkey,
+    chain,
+    from_node: myNodeId,
+    from_pubkey: nodeKeys.publicKeyHex,
+    sdp,
+  };
+  toast("オファーを作成しました。相手に渡してください", "ok");
+  return encodeBlob(blob);
+}
+
+/** Joiner side: accept the offer blob — join the network in place, then
+ * produce an answer blob. */
+async function offlineAcceptOffer(offerText: string, nickname: string): Promise<string> {
+  const blob = decodeBlob<OfferBlob>(offerText);
+  if (blob.t !== "anp-offer" || !blob.network_id || !Array.isArray(blob.chain)) {
+    throw new Error("オファーの形式が不正です");
+  }
+  const storedKeys = await store.get<StoredKeyPair>("kv", "pendingKeys");
+  if (!storedKeys) throw new Error("先に参加リクエストコードを作成してください");
+  const check = await verifyInviteChain(blob.network_id, blob.chain, storedKeys.publicKeyHex);
+  if (!check.ok) throw new Error(`招待証明書が不正です: ${check.reason}`);
+
+  // join in place (no reload): store config+keys and start the node. Keep the
+  // setup screen visible until connected so the answer blob can be copied.
+  await store.put("kv", "nodeKeys", storedKeys);
+  await store.put("kv", "inviteChain", blob.chain);
+  await store.delete("kv", "pendingKeys");
+  await store.put("kv", "config", {
+    network_id: blob.network_id,
+    relays: [], // offline: no relay
+    nickname,
+    is_genesis: false,
+  } satisfies NodeConfig);
+  deferMainView = true;
+  await boot();
+  if (!mesh) throw new Error("ノードの起動に失敗しました");
+
+  const sdp = await mesh.manualAcceptOffer(blob.sdp, blob.from_node, blob.from_pubkey);
+  const answer: AnswerBlob = {
+    v: 1,
+    t: "anp-answer",
+    network_id: blob.network_id,
+    from_node: myNodeId,
+    from_pubkey: nodeKeys!.publicKeyHex,
+    nickname,
+    sdp,
+  };
+  toast("参加しました。アンサーを相手に返してください", "ok");
+  return encodeBlob(answer);
+}
+
+/** Inviter side: apply the joiner's answer blob to finish the connection. */
+async function offlineAcceptAnswer(answerText: string): Promise<void> {
+  if (!mesh) throw new Error("not joined");
+  const blob = decodeBlob<AnswerBlob>(answerText);
+  if (blob.t !== "anp-answer" || !blob.sdp || !blob.from_node) throw new Error("アンサーの形式が不正です");
+  if ((await nodeIdFromPubkey(blob.from_pubkey)) !== blob.from_node) throw new Error("アンサーの識別子が不整合です");
+  await mesh.manualAcceptAnswer(blob.sdp, blob.from_node);
+  toast("接続を完了しました", "ok");
+}
+
+/** Issue a certificate for `subjectPubkey`, returning the full chain that
+ * authorizes them (shared by online invites and offline offers). */
+async function buildInviteChain(
+  subjectPubkey: string,
+  grantInvite: boolean,
+): Promise<{ chain: InviteCertificate[]; cert: InviteCertificate }> {
+  if (!config || !nodeKeys) throw new Error("not joined");
   const rights: Right[] = grantInvite ? ["join", "invite", "chat", "store"] : ["join", "chat", "store"];
   let chain: InviteCertificate[];
   let cert: InviteCertificate;
   if (genesisKeys) {
     // creator: issue directly from the genesis key — shortest possible chain
-    cert = await issueCertificate({
-      networkId: config.network_id,
-      issuer: genesisKeys,
-      subjectPubkey,
-      rights,
-    });
+    cert = await issueCertificate({ networkId: config.network_id, issuer: genesisKeys, subjectPubkey, rights });
     chain = [cert];
   } else {
     if (!myRights.includes("invite")) throw new Error("このノードには招待権がありません");
-    cert = await issueCertificate({
-      networkId: config.network_id,
-      issuer: nodeKeys,
-      subjectPubkey,
-      rights,
-    });
+    cert = await issueCertificate({ networkId: config.network_id, issuer: nodeKeys, subjectPubkey, rights });
     chain = [...inviteChain, cert];
   }
   issuedInvites.push({
@@ -498,6 +612,13 @@ async function issueInvite(subjectPubkey: string, grantInvite: boolean): Promise
   });
   await persistIssued();
   renderInvites();
+  return { chain, cert };
+}
+
+async function issueInvite(subjectPubkey: string, grantInvite: boolean): Promise<{ bundle: string; link: string }> {
+  if (!config || !nodeKeys) throw new Error("not joined");
+  if (!/^[0-9a-f]{130}$/.test(subjectPubkey)) throw new Error("参加リクエストコードの形式が不正です");
+  const { chain } = await buildInviteChain(subjectPubkey, grantInvite);
   const bundle: InviteBundle = {
     v: 1,
     network_id: config.network_id,
@@ -666,6 +787,13 @@ async function startNode(): Promise<void> {
           profile_lamport: 0,
         });
       }
+      // offline joiner: the setup screen was kept up so the answer could be
+      // copied; now that we're connected, switch to the main view
+      if (deferMainView) {
+        deferMainView = false;
+        showMain();
+        renderAll();
+      }
       renderPeers();
     },
     onPeerClose: (nodeId, reason) => {
@@ -716,8 +844,12 @@ async function startNode(): Promise<void> {
   );
 
   latestLeave = await createLeave(config.network_id, nodeKeys);
-  showMain();
-  renderAll();
+  // an offline joiner keeps the setup screen up until connected, so it can copy
+  // the answer blob; otherwise switch to the main view immediately
+  if (!deferMainView) {
+    showMain();
+    renderAll();
+  }
   log(`node started: ${short(myNodeId)} on ${anpUrl(config.network_id)} (proto v2)`);
 }
 
@@ -1457,6 +1589,44 @@ function wireUi(): void {
     $("request-hint").hidden = false;
   });
 
+  // --- offline (relay-less) connection ---
+  busyWrap($("btn-off-request") as HTMLButtonElement, async () => {
+    const code = await prepareJoinRequest();
+    const out = $("off-request-out") as HTMLTextAreaElement;
+    out.value = code;
+    out.hidden = false;
+    $("off-request-hint").hidden = false;
+  });
+
+  busyWrap($("btn-off-answer") as HTMLButtonElement, async () => {
+    const offer = ($("off-offer-in") as HTMLTextAreaElement).value.trim();
+    const nickname = ($("off-nickname") as HTMLInputElement).value.trim() || "member";
+    if (!offer) throw new Error("オファーを貼り付けてください");
+    const answer = await offlineAcceptOffer(offer, nickname);
+    // #main is now shown (joined); surface the answer there and here
+    const out = $("off-answer-out") as HTMLTextAreaElement;
+    out.value = answer;
+    out.hidden = false;
+    $("off-answer-hint").hidden = false;
+    await navigator.clipboard?.writeText(answer).catch(() => {});
+  });
+
+  busyWrap($("btn-off-offer") as HTMLButtonElement, async () => {
+    const subject = ($("off-subject") as HTMLInputElement).value.trim();
+    const grant = ($("off-grant") as HTMLInputElement).checked;
+    const offer = await offlineCreateOffer(subject, grant);
+    const out = $("off-offer-out") as HTMLTextAreaElement;
+    out.value = offer;
+    out.hidden = false;
+    await navigator.clipboard?.writeText(offer).catch(() => {});
+  });
+
+  busyWrap($("btn-off-complete") as HTMLButtonElement, async () => {
+    const answer = ($("off-answer-in") as HTMLTextAreaElement).value.trim();
+    if (!answer) throw new Error("アンサーを貼り付けてください");
+    await offlineAcceptAnswer(answer);
+  });
+
   busyWrap($("btn-join") as HTMLButtonElement, async () => {
     const bundle = ($("join-bundle") as HTMLTextAreaElement).value;
     const nickname = ($("join-nickname") as HTMLInputElement).value.trim() || "member";
@@ -1581,9 +1751,12 @@ function acquireSingleTabLock(): Promise<boolean> {
 }
 
 void (async () => {
-  if (!globalThis.crypto?.subtle || !globalThis.indexedDB) {
+  // Web Crypto is mandatory (signing/keys). It IS available in file:// secure
+  // contexts, so opening the downloaded HTML directly works. IndexedDB is NOT
+  // mandatory — AnpStore falls back to in-memory when it's unavailable.
+  if (!globalThis.crypto?.subtle) {
     fatal(
-      "このアプリには Web Crypto と IndexedDB が必要です。HTTPS または localhost (secure context) で開いてください。",
+      "このアプリには Web Crypto が必要です。ブラウザで直接ファイルを開くか、HTTPS/localhost で開いてください（古いブラウザや非対応環境では動作しません）。",
     );
     return;
   }
@@ -1597,6 +1770,12 @@ void (async () => {
     store = await AnpStore.open();
     wireUi();
     await boot();
+    if (store.ephemeral) {
+      toast(
+        "永続化が使えない環境です（file:// など）。動作はしますが、リロードすると鍵・履歴は消えます。identity のエクスポートで保存できます。",
+        "info",
+      );
+    }
   } catch (err) {
     fatal(`初期化に失敗しました: ${(err as Error).message}`);
   }

@@ -79,6 +79,8 @@ interface Link {
   haveRemote: boolean;
   /** unix seconds when this session began (offer created_at for responders) */
   sessionStartedAt: number;
+  /** manual (relay-less) link: SDP exchanged out-of-band, no trickle signals */
+  manual: boolean;
   handshakeTimer?: ReturnType<typeof setTimeout>;
   lastPongAt: number;
   pingTimer?: ReturnType<typeof setInterval>;
@@ -89,6 +91,8 @@ const RTC_CONFIG: RTCConfiguration = {
 };
 
 const HANDSHAKE_TIMEOUT_MS = 25_000;
+/** manual copy-paste connection: a human is exchanging the blob, so wait longer */
+const MANUAL_HANDSHAKE_TIMEOUT_MS = 5 * 60_000;
 const PING_INTERVAL_MS = 15_000;
 const PONG_DEADLINE_MS = 50_000;
 const RETRY_BASE_MS = 4_000;
@@ -205,6 +209,7 @@ export class Mesh {
     initiator: boolean,
     peerPubkey: string,
     sessionStartedAt: number,
+    manual = false,
   ): Link {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     const link: Link = {
@@ -218,19 +223,25 @@ export class Mesh {
       pendingCandidates: [],
       haveRemote: false,
       sessionStartedAt,
+      manual,
       lastPongAt: Date.now(),
     };
     this.links.set(nodeId, link);
 
-    link.handshakeTimer = setTimeout(() => {
-      if (this.links.get(nodeId) === link && link.state !== "open") {
-        this.dropLink(nodeId, link, "handshake timeout");
-        this.recordFailure(nodeId);
-      }
-    }, HANDSHAKE_TIMEOUT_MS);
+    // manual links get a longer window: a human is copy-pasting the answer
+    link.handshakeTimer = setTimeout(
+      () => {
+        if (this.links.get(nodeId) === link && link.state !== "open") {
+          this.dropLink(nodeId, link, "handshake timeout");
+          this.recordFailure(nodeId);
+        }
+      },
+      manual ? MANUAL_HANDSHAKE_TIMEOUT_MS : HANDSHAKE_TIMEOUT_MS,
+    );
 
     pc.onicecandidate = (ev) => {
       if (this.links.get(nodeId) !== link) return;
+      if (link.manual) return; // manual links embed all candidates in the SDP
       // trickle: forward each candidate (and the null end-of-candidates marker)
       void this.sendSignal(nodeId, link, { kind: "ice", candidate: ev.candidate ? ev.candidate.toJSON() : null });
     };
@@ -395,6 +406,57 @@ export class Mesh {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Manual (relay-less) connection: two people copy-paste one blob each way.
+  // No relay, no server — works when the page is opened straight from a file.
+  // The full SDP (with all ICE candidates gathered) is exchanged out-of-band,
+  // so there is no ongoing signaling channel to maintain.
+  // -------------------------------------------------------------------------
+
+  /** Register a manually-known peer so DataChannel sync treats it normally. */
+  registerManualPeer(peer: PeerInfo): void {
+    const existing = this.peers.get(peer.node_id);
+    this.peers.set(peer.node_id, {
+      ...peer,
+      last_seen: nowSeconds(),
+      rights: peer.rights.length ? peer.rights : (existing?.rights ?? []),
+    });
+  }
+
+  /** Initiator side: create an offer whose SDP embeds all ICE candidates. */
+  async manualCreateOffer(peerNodeId: NodeId, peerPubkey: string): Promise<string> {
+    this.dropLinkById(peerNodeId, "restart manual offer");
+    this.registerManualPeer({ node_id: peerNodeId, pubkey: peerPubkey, last_seen: nowSeconds(), rights: [] });
+    const link = this.newLink(peerNodeId, randomHex(8), true, peerPubkey, nowSeconds(), true);
+    const dc = link.pc.createDataChannel("anp", { ordered: true });
+    this.wireDc(peerNodeId, link, dc);
+    await link.pc.setLocalDescription(await link.pc.createOffer());
+    await waitIceGathering(link.pc);
+    return link.pc.localDescription!.sdp;
+  }
+
+  /** Responder side: accept an offer SDP and return an answer SDP. */
+  async manualAcceptOffer(offerSdp: string, peerNodeId: NodeId, peerPubkey: string): Promise<string> {
+    this.dropLinkById(peerNodeId, "restart manual answer");
+    this.registerManualPeer({ node_id: peerNodeId, pubkey: peerPubkey, last_seen: nowSeconds(), rights: [] });
+    const link = this.newLink(peerNodeId, randomHex(8), false, peerPubkey, nowSeconds(), true);
+    link.pc.ondatachannel = (ev) => this.wireDc(peerNodeId, link, ev.channel);
+    await link.pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+    link.haveRemote = true;
+    await link.pc.setLocalDescription(await link.pc.createAnswer());
+    await waitIceGathering(link.pc);
+    return link.pc.localDescription!.sdp;
+  }
+
+  /** Initiator side: apply the answer SDP to finish the manual handshake. */
+  async manualAcceptAnswer(answerSdp: string, peerNodeId: NodeId): Promise<void> {
+    const link = this.links.get(peerNodeId);
+    if (!link || !link.initiator || !link.manual) throw new Error("no pending manual offer for this peer");
+    if (link.haveRemote) return;
+    await link.pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    link.haveRemote = true;
+  }
+
   private wireDc(nodeId: NodeId, link: Link, dc: RTCDataChannel): void {
     link.dc = dc;
     dc.onopen = () => {
@@ -538,6 +600,23 @@ export class Mesh {
 
 function short(id: string): string {
   return id.slice(0, 8);
+}
+
+/** Wait until ICE gathering completes (or a short cap), so a manual SDP
+ * contains every candidate and needs no follow-up signaling. */
+function waitIceGathering(pc: RTCPeerConnection): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      pc.removeEventListener("icegatheringstatechange", check);
+      resolve();
+    };
+    const check = () => {
+      if (pc.iceGatheringState === "complete") done();
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+    setTimeout(done, 4000); // cap: STUN may never fully settle
+  });
 }
 
 export { nowSeconds };

@@ -10,7 +10,8 @@
     "relay": "tsx src/relay/server.ts",
     "start": "npm run build && npm run relay",
     "test": "node --import tsx --test test/*.test.ts",
-    "test:e2e": "node test/e2e.browser.mjs"
+    "test:e2e": "node test/e2e.browser.mjs",
+    "test:e2e:offline": "node test/e2e.offline.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
