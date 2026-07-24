@@ -27,13 +27,16 @@ export type NodeId = string;
 /** hex raw uncompressed P-256 public key */
 export type PubKeyHex = string;
 
-export type Right = "join" | "invite" | "chat" | "store" | "admin";
+/** Discovery spec §5.2: rights include `discover` (may query/receive the
+ * peer table and candidate set). */
+export type Right = "join" | "discover" | "invite" | "chat" | "store" | "admin";
 
 export const PROTOCOL_VERSION = 2;
 
 /**
- * Invitation Certificate (design doc §4.3 / §12).
+ * Invitation Certificate (design doc §4.3 / §12, discovery spec §5.2).
  * A chain of these, rooted at the genesis key, authorizes a node to join.
+ * `nonce` makes two otherwise-identical certificates distinct (replay).
  */
 export interface InviteCertificate {
   type: "INVITE";
@@ -44,6 +47,7 @@ export interface InviteCertificate {
   rights: Right[];
   issued_at: number;
   expires_at: number;
+  nonce: string;
   revoked: boolean;
   signature: string;
 }
@@ -66,7 +70,9 @@ export type RevocationMap = Map<string, Set<PubKeyHex>>;
 // Discovery / transport events (design doc §6, §7, §9)
 // ---------------------------------------------------------------------------
 
-export type EventType = "JOIN" | "HEARTBEAT" | "LEAVE" | "MANIFEST" | "SIGNAL";
+/** Discovery spec §6.2: JOIN / HEARTBEAT / LEAVE / MANIFEST / INVITE.
+ * SIGNAL is our transport-layer addition (encrypted SDP/ICE, §9.3.2). */
+export type EventType = "JOIN" | "HEARTBEAT" | "LEAVE" | "MANIFEST" | "INVITE" | "SIGNAL";
 
 export interface EventBase {
   /** sha256 of the canonical event without `id`/`signature` */
@@ -98,6 +104,12 @@ export interface JoinBody {
 export interface ManifestBody {
   relays: string[];
   records: NameRecord[];
+}
+
+/** INVITE event body (discovery spec §6.2): publishes a signed certificate so
+ * the invitee can fetch it from a relay instead of an out-of-band copy/paste. */
+export interface InviteBody {
+  certificate: InviteCertificate;
 }
 
 /** Decrypted contents of a SIGNAL event (ECIES plaintext). */
@@ -133,12 +145,22 @@ export interface ManifestEvent extends EventBase {
   type: "MANIFEST";
   body: ManifestBody;
 }
+export interface InviteEvent extends EventBase {
+  type: "INVITE";
+  body: InviteBody;
+}
 export interface SignalEvent extends EventBase {
   type: "SIGNAL";
   body: SignalBody;
 }
 
-export type AnpEvent = JoinEvent | HeartbeatEvent | LeaveEvent | ManifestEvent | SignalEvent;
+export type AnpEvent =
+  | JoinEvent
+  | HeartbeatEvent
+  | LeaveEvent
+  | ManifestEvent
+  | InviteEvent
+  | SignalEvent;
 
 // ---------------------------------------------------------------------------
 // Relay wire protocol (design doc §7.2) — Nostr-like WebSocket frames
@@ -218,12 +240,33 @@ export interface MemberRecord {
 }
 
 /** Live peer-table entry (discovery view; superset source is `MemberRecord`). */
+/** What a node can do for the network (discovery spec §10.1). */
+export type Capability = "chat" | "store" | "relay" | "nameservice";
+
 export interface PeerInfo {
   node_id: NodeId;
   pubkey: PubKeyHex;
   nickname?: string;
   last_seen: number;
   rights: Right[];
+  /** discovery spec §10.1 */
+  capabilities?: Capability[];
+  /** measured or gossiped round-trip hint, ms */
+  latency_hint?: number;
+}
+
+/**
+ * Peer Table entry exchanged after a DataChannel opens (discovery spec §10.1).
+ * Chained discovery (§10.3): a new node learns about peers it never saw on a
+ * relay, so the network leans less on relays as it grows (§1.5).
+ */
+export interface PeerTableEntry {
+  node_id: NodeId;
+  pubkey: PubKeyHex;
+  last_seen: number;
+  capabilities: Capability[];
+  latency_hint?: number;
+  nickname?: string;
 }
 
 // ---------------------------------------------------------------------------

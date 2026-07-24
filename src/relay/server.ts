@@ -152,21 +152,24 @@ class EventStore {
     if (bucket.has(event.id)) return { added: false, reason: "duplicate" };
 
     // A node's newer JOIN/HEARTBEAT/MANIFEST/LEAVE supersedes its older one.
+    // SIGNAL and INVITE are point-to-point/per-subject: many coexist per node,
+    // so they are capped instead of superseded.
+    const multi = event.type === "SIGNAL" || event.type === "INVITE";
     let discoveryCount = 0;
-    let signalCount = 0;
+    let multiCount = 0;
     for (const [id, existing] of bucket) {
       if (existing.node_id !== event.node_id) continue;
-      if (existing.type === "SIGNAL") signalCount++;
+      if (existing.type === "SIGNAL" || existing.type === "INVITE") multiCount++;
       else discoveryCount++;
-      if (event.type !== "SIGNAL" && existing.type === event.type) {
+      if (!multi && existing.type === event.type) {
         bucket.delete(id);
         discoveryCount--;
       }
     }
-    if (event.type === "SIGNAL" && signalCount >= MAX_SIGNALS_PER_NODE) {
-      return { added: false, reason: "per-node signal cap" };
+    if (multi && multiCount >= MAX_SIGNALS_PER_NODE) {
+      return { added: false, reason: "per-node signal/invite cap" };
     }
-    if (event.type !== "SIGNAL" && discoveryCount >= MAX_EVENTS_PER_NODE) {
+    if (!multi && discoveryCount >= MAX_EVENTS_PER_NODE) {
       return { added: false, reason: "per-node event cap" };
     }
     if (bucket.size >= MAX_EVENTS_PER_NETWORK) this.evictOldest(bucket);

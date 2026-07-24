@@ -26,7 +26,14 @@ import {
   utf8Encode,
   verifyObject,
 } from "./crypto.js";
-import { dmPubkeys, isDmRoom, nodeIdFromPubkey, openNetworkId, verifyInviteChain } from "./identity.js";
+import {
+  dmPubkeys,
+  isDmRoom,
+  nodeIdFromPubkey,
+  openNetworkId,
+  verifyCertificate,
+  verifyInviteChain,
+} from "./identity.js";
 import type {
   AnpEvent,
   EventType,
@@ -111,7 +118,7 @@ async function verifyEventInner(event: AnpEvent, opts: VerifyOptions): Promise<V
   const now = opts.now ?? nowSeconds();
   if (!event || typeof event !== "object") return { ok: false, reason: "not an object" };
   const { type, network_id, node_id, pubkey, signature } = event;
-  if (!["JOIN", "HEARTBEAT", "LEAVE", "MANIFEST", "SIGNAL"].includes(type)) {
+  if (!["JOIN", "HEARTBEAT", "LEAVE", "MANIFEST", "INVITE", "SIGNAL"].includes(type)) {
     return { ok: false, reason: "unknown event type" };
   }
   if (typeof network_id !== "string" || !/^[0-9a-f]{64}$/.test(network_id)) {
@@ -179,6 +186,15 @@ async function verifyEventInner(event: AnpEvent, opts: VerifyOptions): Promise<V
     ) {
       return { ok: false, reason: "malformed signal body" };
     }
+  }
+  if (event.type === "INVITE") {
+    // Discovery spec §6.2: a certificate published for the invitee to fetch.
+    // Only its own issuer may publish it, and it must be for this network.
+    const cert = (event.body as { certificate?: InviteCertificate })?.certificate;
+    if (!cert || cert.type !== "INVITE") return { ok: false, reason: "malformed invite body" };
+    if (cert.network_id !== network_id) return { ok: false, reason: "invite for another network" };
+    if (cert.issuer_pubkey !== pubkey) return { ok: false, reason: "invite not published by its issuer" };
+    if (!(await verifyCertificate(cert, now))) return { ok: false, reason: "invalid certificate" };
   }
   return { ok: true };
 }
@@ -255,6 +271,17 @@ export async function createManifest(
   body: ManifestBody,
 ): Promise<AnpEvent> {
   return createEvent({ type: "MANIFEST", networkId, keys, ttl: MANIFEST_TTL, body });
+}
+
+/** Publish an invite certificate on the relay (discovery spec §6.2) so the
+ * invitee can pick it up without an out-of-band handoff. */
+export async function createInvite(
+  networkId: NetworkId,
+  keys: KeyPairHandle,
+  certificate: InviteCertificate,
+): Promise<AnpEvent> {
+  const ttl = Math.max(60, Math.min(certificate.expires_at - nowSeconds(), 24 * 3600));
+  return createEvent({ type: "INVITE", networkId, keys, ttl, body: { certificate } });
 }
 
 /** Encrypt a signal payload to the target's public key and wrap it in a signed SIGNAL event. */

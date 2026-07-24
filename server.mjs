@@ -23210,8 +23210,22 @@ function hasPow(idHex, bits) {
   return leadingZeroBits(idHex) >= bits;
 }
 
+// src/shared/types.ts
+var PROTOCOL_VERSION = 2;
+
 // src/shared/identity.ts
 var MAX_CHAIN_LENGTH = 16;
+var DOMAIN_TAG = "anp-network";
+function concatBytes(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
 var OPEN_PREFIX = "anp-open-v1:";
 async function openNetworkId(room) {
   return sha256Hex(utf8Encode(OPEN_PREFIX + room));
@@ -23223,8 +23237,8 @@ function dmPubkeys(room) {
 function isDmRoom(room) {
   return typeof room === "string" && room.startsWith("dm:");
 }
-async function networkIdFromGenesisPubkey(genesisPubkeyHex) {
-  return sha256Hex(hexToBytes(genesisPubkeyHex));
+async function networkIdFromGenesisPubkey(genesisPubkeyHex, proto = PROTOCOL_VERSION) {
+  return sha256Hex(concatBytes(hexToBytes(genesisPubkeyHex), utf8Encode(`|${proto}|${DOMAIN_TAG}`)));
 }
 async function nodeIdFromPubkey(pubkeyHex) {
   return sha256Hex(hexToBytes(pubkeyHex));
@@ -23300,7 +23314,7 @@ async function verifyEventInner(event, opts) {
   const now = opts.now ?? nowSeconds();
   if (!event || typeof event !== "object") return { ok: false, reason: "not an object" };
   const { type, network_id, node_id, pubkey, signature } = event;
-  if (!["JOIN", "HEARTBEAT", "LEAVE", "MANIFEST", "SIGNAL"].includes(type)) {
+  if (!["JOIN", "HEARTBEAT", "LEAVE", "MANIFEST", "INVITE", "SIGNAL"].includes(type)) {
     return { ok: false, reason: "unknown event type" };
   }
   if (typeof network_id !== "string" || !/^[0-9a-f]{64}$/.test(network_id)) {
@@ -23357,6 +23371,13 @@ async function verifyEventInner(event, opts) {
     if (typeof body?.target !== "string" || typeof body?.session !== "string" || typeof body?.seq !== "number" || typeof body?.enc?.epk !== "string" || typeof body?.enc?.iv !== "string" || typeof body?.enc?.ct !== "string") {
       return { ok: false, reason: "malformed signal body" };
     }
+  }
+  if (event.type === "INVITE") {
+    const cert = event.body?.certificate;
+    if (!cert || cert.type !== "INVITE") return { ok: false, reason: "malformed invite body" };
+    if (cert.network_id !== network_id) return { ok: false, reason: "invite for another network" };
+    if (cert.issuer_pubkey !== pubkey) return { ok: false, reason: "invite not published by its issuer" };
+    if (!await verifyCertificate(cert, now)) return { ok: false, reason: "invalid certificate" };
   }
   return { ok: true };
 }
@@ -23446,21 +23467,22 @@ var EventStore = class {
       }
     }
     if (bucket.has(event.id)) return { added: false, reason: "duplicate" };
+    const multi = event.type === "SIGNAL" || event.type === "INVITE";
     let discoveryCount = 0;
-    let signalCount = 0;
+    let multiCount = 0;
     for (const [id, existing] of bucket) {
       if (existing.node_id !== event.node_id) continue;
-      if (existing.type === "SIGNAL") signalCount++;
+      if (existing.type === "SIGNAL" || existing.type === "INVITE") multiCount++;
       else discoveryCount++;
-      if (event.type !== "SIGNAL" && existing.type === event.type) {
+      if (!multi && existing.type === event.type) {
         bucket.delete(id);
         discoveryCount--;
       }
     }
-    if (event.type === "SIGNAL" && signalCount >= MAX_SIGNALS_PER_NODE) {
-      return { added: false, reason: "per-node signal cap" };
+    if (multi && multiCount >= MAX_SIGNALS_PER_NODE) {
+      return { added: false, reason: "per-node signal/invite cap" };
     }
-    if (event.type !== "SIGNAL" && discoveryCount >= MAX_EVENTS_PER_NODE) {
+    if (!multi && discoveryCount >= MAX_EVENTS_PER_NODE) {
       return { added: false, reason: "per-node event cap" };
     }
     if (bucket.size >= MAX_EVENTS_PER_NETWORK) this.evictOldest(bucket);

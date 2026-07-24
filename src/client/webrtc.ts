@@ -34,6 +34,7 @@ import type {
   NetworkId,
   NodeId,
   PeerInfo,
+  PeerTableEntry,
   SignalEvent,
 } from "../shared/types.js";
 import { nowSeconds, randomHex } from "../shared/crypto.js";
@@ -48,6 +49,7 @@ export type DcMessage =
   | { t: "MEMBER_PROOF"; node_id: NodeId; pubkey: string; nickname?: string; chain: InviteCertificate[] }
   | { t: "PING"; ts: number }
   | { t: "PONG"; ts: number }
+  | { t: "PEER_TABLE"; peers: PeerTableEntry[] }
   | { t: "BLOB_REQ"; cid: string }
   | { t: "BLOB_META"; cid: string; size: number; chunks: number; name?: string; mime?: string }
   | { t: "BLOB_CHUNK"; cid: string; idx: number; data: string }
@@ -434,6 +436,12 @@ export class Mesh {
       }
       if (msg.t === "PONG") {
         link.lastPongAt = Date.now();
+        // round-trip measurement feeds the discovery latency score (§8.3)
+        const rtt = Date.now() - msg.ts;
+        if (rtt >= 0 && rtt < 60_000) {
+          const peer = this.peers.get(nodeId);
+          if (peer) peer.latency_hint = peer.latency_hint ? Math.round(peer.latency_hint * 0.7 + rtt * 0.3) : rtt;
+        }
         return;
       }
       this.cb.onMessage(nodeId, msg);
@@ -502,6 +510,49 @@ export class Mesh {
       if (link.state === "open" && link.dc?.readyState === "open") out.push(nodeId);
     }
     return out;
+  }
+
+  /**
+   * Chained discovery (discovery spec §10.3): adopt a peer we learned about
+   * through another node's peer table rather than a relay, and try to connect.
+   * As the network grows this is how relay dependence thins out (§1.5).
+   */
+  introducePeer(entry: PeerTableEntry): boolean {
+    if (this.stopped || entry.node_id === this.myNodeId) return false;
+    if (this.peers.has(entry.node_id)) return false;
+    this.peers.set(entry.node_id, {
+      node_id: entry.node_id,
+      pubkey: entry.pubkey,
+      nickname: entry.nickname,
+      last_seen: entry.last_seen,
+      rights: [],
+      capabilities: entry.capabilities,
+      latency_hint: entry.latency_hint,
+    });
+    this.maybeConnect(entry.node_id);
+    return true;
+  }
+
+  /** Snapshot for the peer table we hand to newly connected peers (§10.1). */
+  peerTable(myEntry: PeerTableEntry): PeerTableEntry[] {
+    const open = new Set(this.connectedNodeIds());
+    const rows: PeerTableEntry[] = [myEntry];
+    for (const p of this.peers.values()) {
+      if (!open.has(p.node_id)) continue; // only vouch for peers we can actually reach
+      rows.push({
+        node_id: p.node_id,
+        pubkey: p.pubkey,
+        last_seen: p.last_seen,
+        capabilities: p.capabilities ?? ["chat", "store"],
+        latency_hint: p.latency_hint,
+        nickname: p.nickname,
+      });
+    }
+    return rows;
+  }
+
+  peerInfo(nodeId: NodeId): PeerInfo | undefined {
+    return this.peers.get(nodeId);
   }
 
   /** Forcibly remove a peer (e.g. after its invite was revoked). */

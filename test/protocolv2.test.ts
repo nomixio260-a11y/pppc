@@ -363,3 +363,49 @@ test("a member cannot un-revoke by squatting the revoked/ namespace (LWW-squat f
   // genesis's revocation still stands
   assert.ok(store.revocations().get(inviteId)?.has(genesis.publicKeyHex));
 });
+
+// ---------------------------------------------------------------------------
+// INVITE as a discovery event (discovery spec §6.2)
+// ---------------------------------------------------------------------------
+
+test("INVITE events publish a certificate, and only its issuer may do so", async () => {
+  const { createInvite } = await import("../src/shared/events.js");
+  const { issueCertificate: issue } = await import("../src/shared/identity.js");
+  const genesis = await generateKeyPair();
+  const invitee = await generateKeyPair();
+  const stranger = await generateKeyPair();
+  const networkId = await networkIdFromGenesisPubkey(genesis.publicKeyHex);
+  const cert = await issue({
+    networkId,
+    issuer: genesis,
+    subjectPubkey: invitee.publicKeyHex,
+    rights: ["join", "discover", "chat"],
+  });
+
+  // the issuer publishing its own certificate verifies
+  const ok = await createInvite(networkId, genesis, cert);
+  assert.equal((await verifyEvent(ok)).ok, true);
+
+  // someone else republishing it is rejected
+  const forged = await createInvite(networkId, stranger, cert);
+  const r = await verifyEvent(forged);
+  assert.equal(r.ok, false);
+  assert.match(r.reason ?? "", /not published by its issuer/);
+});
+
+test("certificates carry a nonce and the discover right survives the chain", async () => {
+  const { issueCertificate: issue } = await import("../src/shared/identity.js");
+  const genesis = await generateKeyPair();
+  const node = await generateKeyPair();
+  const networkId = await networkIdFromGenesisPubkey(genesis.publicKeyHex);
+  const cert = await issue({
+    networkId,
+    issuer: genesis,
+    subjectPubkey: node.publicKeyHex,
+    rights: ["join", "discover", "chat"],
+  });
+  assert.match(cert.nonce, /^[0-9a-f]{16}$/);
+  const check = await verifyInviteChain(networkId, [cert], node.publicKeyHex);
+  assert.equal(check.ok, true);
+  assert.ok(check.rights.includes("discover"));
+});

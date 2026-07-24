@@ -109,6 +109,27 @@ test/          ユニット70件 + 実ブラウザE2E
 
 以下は基盤プロトコル ANP v2 の詳細（チャットUIはこの上に構築）。
 
+## ノード探索・発見・接続（Discovery仕様 v1.0 への対応）
+
+| 仕様 | 実装 |
+|---|---|
+| §4.2 `Network ID = SHA-256(GenesisPubkey ‖ ProtocolVersion ‖ FixedDomainTag)` | `identity.ts` `networkIdFromGenesisPubkey`（`DOMAIN_TAG="anp-network"`） |
+| §5.2 招待証明書（`nonce`・`discover` 権限を含む） | `types.ts` / `identity.ts` `issueCertificate` |
+| §6.2 Discoveryイベント JOIN/HEARTBEAT/LEAVE/MANIFEST/**INVITE** | `events.ts`（INVITEは発行者のみ公開可能・Relayは per-subject で保持） |
+| §7 Relay（PUT/QUERY/SUBSCRIBE・TTL破棄・複数Relay） | `relay/server.ts` / `relayclient.ts` |
+| **§8 候補スコアリング（invite/freshness/heartbeat/relay多様性/latency）** | **`shared/discovery.ts`（純粋関数・単体テスト済み）** |
+| **§8.3 Step5 決定的選択（同点は Node ID 辞書順、乱択しない）** | `rankCandidates` / `selectCandidate`（入力順に依存しないことをテストで保証） |
+| §9 WebRTC（Relayをシグナリングに使用・Offer/Answer/ICE） | `webrtc.ts`（SIGNALはECIESで暗号化・Trickle ICE） |
+| **§10.1 Peer Table（`capabilities`・`latency_hint`）** | `PEER_TABLE` メッセージ。latencyはPING/PONGのRTTを指数平滑で計測 |
+| **§10.3 連鎖的発見（Relay依存を薄める）** | `introducePeer`：Relayで見ていないノードをPeer Table経由で採用 |
+| §1.5 育つほどRelay依存が減る | 直結が3以上でHEARTBEAT間隔を半減（`relayIndependent()`） |
+| §11 Name Service（`bootstrap`/`service/*` をDNS的に解決） | `conversation.ts` が署名付きレコードを複製し `resolve()`/`serviceNodes()` を提供 |
+| §12 失敗時（Relayフェイルオーバー・候補送り・再シグナリング・0人なら自分が最初） | 複数Relay + 送信キュー、候補スコア順の再試行（指数バックオフ）、候補0なら自分のJOINで開始 |
+| §13 ローカル保存（鍵・証明書・Peer Table・NSレコード・CRDT） | IndexedDB（`peers`/`ns`/`crdt`/`kv`、Peer Tableは再起動後の初期候補になる） |
+| §14 セキュリティ（招待制・署名・TTL・重複JOIN抑制・レピュテーション） | 全イベント署名必須、TTL、Relayのper-node上限、`reputation.ts` |
+
+> 補足: 現在の既定UIはチャンネル/DM（オープンルーム）なので、§5の招待制は「招待制ネットワーク」を選んだ場合に適用されます。招待チェーン・失効・権限委譲の実装はそのまま有効です。
+
 ## プロトコル要点
 
 ### 会話モデル（チャンネル / DM）

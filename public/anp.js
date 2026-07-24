@@ -182,8 +182,22 @@ function hasPow(idHex, bits) {
   return leadingZeroBits(idHex) >= bits;
 }
 
+// src/shared/types.ts
+var PROTOCOL_VERSION = 2;
+
 // src/shared/identity.ts
 var MAX_CHAIN_LENGTH = 16;
+var DOMAIN_TAG = "anp-network";
+function concatBytes(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
 var OPEN_PREFIX = "anp-open-v1:";
 async function openNetworkId(room) {
   return sha256Hex(utf8Encode(OPEN_PREFIX + room));
@@ -205,8 +219,8 @@ function isDmRoom(room) {
 async function dmNetworkId(pubkeyA, pubkeyB) {
   return openNetworkId(dmRoom(pubkeyA, pubkeyB));
 }
-async function networkIdFromGenesisPubkey(genesisPubkeyHex) {
-  return sha256Hex(hexToBytes(genesisPubkeyHex));
+async function networkIdFromGenesisPubkey(genesisPubkeyHex, proto = PROTOCOL_VERSION) {
+  return sha256Hex(concatBytes(hexToBytes(genesisPubkeyHex), utf8Encode(`|${proto}|${DOMAIN_TAG}`)));
 }
 async function nodeIdFromPubkey(pubkeyHex) {
   return sha256Hex(hexToBytes(pubkeyHex));
@@ -435,11 +449,11 @@ var Reputation = class _Reputation {
    * praise) fade: score *= DECAY, and entries that have decayed to ~0 with no
    * recent activity are dropped.
    */
-  static fromJSON(records, decay = DECAY) {
+  static fromJSON(records, decay2 = DECAY) {
     const rep = new _Reputation();
     for (const record of records ?? []) {
       if (!record || typeof record.node_id !== "string" || typeof record.score !== "number") continue;
-      const score = record.score * decay;
+      const score = record.score * decay2;
       if (Math.abs(score) < 0.5) continue;
       rep.scores.set(record.node_id, { ...record, score });
     }
@@ -447,14 +461,12 @@ var Reputation = class _Reputation {
   }
 };
 
-// src/shared/types.ts
-var PROTOCOL_VERSION = 2;
-
 // src/shared/events.ts
 var JOIN_TTL = 300;
 var HEARTBEAT_TTL = 90;
 var HEARTBEAT_INTERVAL = 30;
 var SIGNAL_TTL = 60;
+var MANIFEST_TTL = 600;
 var POW_BITS = 12;
 var POW_MAX_ITERATIONS = 2e6;
 async function createEvent(opts) {
@@ -485,7 +497,7 @@ async function verifyEventInner(event, opts) {
   const now = opts.now ?? nowSeconds();
   if (!event || typeof event !== "object") return { ok: false, reason: "not an object" };
   const { type, network_id, node_id, pubkey, signature } = event;
-  if (!["JOIN", "HEARTBEAT", "LEAVE", "MANIFEST", "SIGNAL"].includes(type)) {
+  if (!["JOIN", "HEARTBEAT", "LEAVE", "MANIFEST", "INVITE", "SIGNAL"].includes(type)) {
     return { ok: false, reason: "unknown event type" };
   }
   if (typeof network_id !== "string" || !/^[0-9a-f]{64}$/.test(network_id)) {
@@ -543,6 +555,13 @@ async function verifyEventInner(event, opts) {
       return { ok: false, reason: "malformed signal body" };
     }
   }
+  if (event.type === "INVITE") {
+    const cert = event.body?.certificate;
+    if (!cert || cert.type !== "INVITE") return { ok: false, reason: "malformed invite body" };
+    if (cert.network_id !== network_id) return { ok: false, reason: "invite for another network" };
+    if (cert.issuer_pubkey !== pubkey) return { ok: false, reason: "invite not published by its issuer" };
+    if (!await verifyCertificate(cert, now)) return { ok: false, reason: "invalid certificate" };
+  }
   return { ok: true };
 }
 async function createJoin(networkId, keys, inviteChain, nicknameOrOpts, powBitsArg = POW_BITS) {
@@ -583,6 +602,9 @@ async function createHeartbeat(networkId, keys) {
 }
 async function createLeave(networkId, keys) {
   return createEvent({ type: "LEAVE", networkId, keys, ttl: HEARTBEAT_TTL, body: {} });
+}
+async function createManifest(networkId, keys, body) {
+  return createEvent({ type: "MANIFEST", networkId, keys, ttl: MANIFEST_TTL, body });
 }
 async function createSignal(networkId, keys, target, targetPubkey, session, seq, payload) {
   const enc = await eciesEncrypt(targetPubkey, utf8Encode(JSON.stringify(payload)));
@@ -692,6 +714,155 @@ var GSetLog = class _GSetLog {
     const log2 = new _GSetLog(origin);
     log2.merge(entries ?? []);
     return log2;
+  }
+};
+
+// src/shared/discovery.ts
+var WEIGHTS = {
+  invite: 40,
+  freshness: 25,
+  heartbeat: 20,
+  relayDiversity: 10,
+  latency: 15
+};
+var LATENCY_CEILING_MS = 500;
+var LATENCY_UNKNOWN = 0.5;
+var clamp01 = (n) => n < 0 ? 0 : n > 1 ? 1 : n;
+function decay(at, now, ttl) {
+  if (!at) return 0;
+  return clamp01(1 - (now - at) / ttl);
+}
+function scoreCandidate(c, now) {
+  const invite = c.invite_match ? WEIGHTS.invite : 0;
+  const freshness = WEIGHTS.freshness * decay(c.join_at, now, JOIN_TTL);
+  const heartbeat = WEIGHTS.heartbeat * decay(c.heartbeat_at, now, HEARTBEAT_TTL);
+  const diversity = WEIGHTS.relayDiversity * clamp01((c.relay_count - 1) / 2);
+  const latency = WEIGHTS.latency * (c.latency_ms === void 0 ? LATENCY_UNKNOWN : clamp01(1 - c.latency_ms / LATENCY_CEILING_MS));
+  return invite + freshness + heartbeat + diversity + latency;
+}
+function rankCandidates(candidates, now) {
+  return candidates.map((c) => ({ ...c, score: scoreCandidate(c, now) })).sort((a, b) => {
+    const d = Math.round((b.score - a.score) * 1e6);
+    if (d !== 0) return d;
+    return a.node_id < b.node_id ? -1 : a.node_id > b.node_id ? 1 : 0;
+  });
+}
+function isViable(c, now) {
+  if (c.via_peer_table && now - c.join_at <= JOIN_TTL) return true;
+  return decay(c.join_at, now, JOIN_TTL) > 0 || decay(c.heartbeat_at, now, HEARTBEAT_TTL) > 0;
+}
+
+// src/shared/nameservice.ts
+var REVOKED_PREFIX = "revoked/";
+function parseRevocationName(name) {
+  if (!name.startsWith(REVOKED_PREFIX)) return null;
+  const rest = name.slice(REVOKED_PREFIX.length);
+  const slash = rest.lastIndexOf("/");
+  if (slash <= 0 || slash === rest.length - 1) return null;
+  const inviteId = rest.slice(0, slash);
+  const authorPubkey = rest.slice(slash + 1);
+  if (!/^[0-9a-f]{130}$/.test(authorPubkey)) return null;
+  return { inviteId, authorPubkey };
+}
+function isValidRevocationRecord(record) {
+  const parts = parseRevocationName(record.name);
+  if (!parts) return false;
+  if (parts.authorPubkey !== record.author_pubkey) return false;
+  const value = record.value;
+  return value?.kind === "revocation" && value.invite_id === parts.inviteId;
+}
+async function createNameRecord(networkId, keys, name, value, version, ttl = 600) {
+  const record = {
+    network_id: networkId,
+    name,
+    value,
+    version,
+    ttl,
+    updated_at: nowSeconds(),
+    author_pubkey: keys.publicKeyHex,
+    signature: ""
+  };
+  record.signature = await signObject(keys.privateKey, record, [
+    "signature"
+  ]);
+  return record;
+}
+async function verifyNameRecord(record) {
+  if (!record || typeof record.name !== "string" || typeof record.version !== "number") return false;
+  return verifyObject(record.author_pubkey, record, ["signature"]);
+}
+function isExpired(record, now = nowSeconds()) {
+  return record.updated_at + record.ttl <= now;
+}
+function pickNewer(a, b) {
+  if (a.version !== b.version) return a.version > b.version ? a : b;
+  if (a.updated_at !== b.updated_at) return a.updated_at > b.updated_at ? a : b;
+  return a.signature >= b.signature ? a : b;
+}
+var NameServiceStore = class {
+  constructor(networkId) {
+    this.networkId = networkId;
+  }
+  records = /* @__PURE__ */ new Map();
+  /** Merge one record in; returns true if it became the winner for its name. */
+  async merge(record, now = nowSeconds()) {
+    if (record.network_id !== this.networkId) return false;
+    if (isExpired(record, now)) return false;
+    if (typeof record.name !== "string") return false;
+    if (record.name.startsWith(REVOKED_PREFIX) && !isValidRevocationRecord(record)) return false;
+    if (!await verifyNameRecord(record)) return false;
+    const current = this.records.get(record.name);
+    if (!current || isExpired(current, now)) {
+      this.records.set(record.name, record);
+      return true;
+    }
+    if (pickNewer(record, current) === record && record.signature !== current.signature) {
+      this.records.set(record.name, record);
+      return true;
+    }
+    return false;
+  }
+  resolve(name, now = nowSeconds()) {
+    const record = this.records.get(name);
+    if (!record) return void 0;
+    if (isExpired(record, now)) {
+      this.records.delete(record.name);
+      return void 0;
+    }
+    return record;
+  }
+  all(now = nowSeconds()) {
+    for (const [name, record] of this.records) {
+      if (isExpired(record, now)) this.records.delete(name);
+    }
+    return [...this.records.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  load(records) {
+    for (const record of records) {
+      const current = this.records.get(record.name);
+      this.records.set(record.name, current ? pickNewer(record, current) : record);
+    }
+  }
+  /**
+   * Extract the revocation map from `revoked/<invite_id>/<author>` records.
+   * Each valid record contributes its author to the invite's revoker set; the
+   * map only carries who *claimed* each revocation, and authority (issuer or
+   * genesis) is judged at chain-verification time by `isCertRevoked`.
+   */
+  revocations(now = nowSeconds()) {
+    const map = /* @__PURE__ */ new Map();
+    for (const record of this.all(now)) {
+      if (!record.name.startsWith(REVOKED_PREFIX)) continue;
+      if (!isValidRevocationRecord(record)) continue;
+      const value = record.value;
+      let revokers = map.get(value.invite_id);
+      if (!revokers) {
+        revokers = /* @__PURE__ */ new Set();
+        map.set(value.invite_id, revokers);
+      }
+      revokers.add(record.author_pubkey);
+    }
+    return map;
   }
 };
 
@@ -1146,6 +1317,11 @@ var Mesh = class {
       }
       if (msg.t === "PONG") {
         link.lastPongAt = Date.now();
+        const rtt = Date.now() - msg.ts;
+        if (rtt >= 0 && rtt < 6e4) {
+          const peer = this.peers.get(nodeId);
+          if (peer) peer.latency_hint = peer.latency_hint ? Math.round(peer.latency_hint * 0.7 + rtt * 0.3) : rtt;
+        }
         return;
       }
       this.cb.onMessage(nodeId, msg);
@@ -1206,6 +1382,46 @@ var Mesh = class {
       if (link.state === "open" && link.dc?.readyState === "open") out.push(nodeId);
     }
     return out;
+  }
+  /**
+   * Chained discovery (discovery spec §10.3): adopt a peer we learned about
+   * through another node's peer table rather than a relay, and try to connect.
+   * As the network grows this is how relay dependence thins out (§1.5).
+   */
+  introducePeer(entry) {
+    if (this.stopped || entry.node_id === this.myNodeId) return false;
+    if (this.peers.has(entry.node_id)) return false;
+    this.peers.set(entry.node_id, {
+      node_id: entry.node_id,
+      pubkey: entry.pubkey,
+      nickname: entry.nickname,
+      last_seen: entry.last_seen,
+      rights: [],
+      capabilities: entry.capabilities,
+      latency_hint: entry.latency_hint
+    });
+    this.maybeConnect(entry.node_id);
+    return true;
+  }
+  /** Snapshot for the peer table we hand to newly connected peers (§10.1). */
+  peerTable(myEntry) {
+    const open = new Set(this.connectedNodeIds());
+    const rows = [myEntry];
+    for (const p of this.peers.values()) {
+      if (!open.has(p.node_id)) continue;
+      rows.push({
+        node_id: p.node_id,
+        pubkey: p.pubkey,
+        last_seen: p.last_seen,
+        capabilities: p.capabilities ?? ["chat", "store"],
+        latency_hint: p.latency_hint,
+        nickname: p.nickname
+      });
+    }
+    return rows;
+  }
+  peerInfo(nodeId) {
+    return this.peers.get(nodeId);
   }
   /** Forcibly remove a peer (e.g. after its invite was revoked). */
   removePeer(nodeId) {
@@ -1445,6 +1661,8 @@ var FileService = class {
 // src/client/conversation.ts
 var ANTI_ENTROPY_MS = 6e4;
 var MAX_ENTRIES_PER_DELTA = 512;
+var MY_CAPABILITIES = ["chat", "store", "nameservice"];
+var RELAY_INDEPENDENCE_AT = 3;
 var Conversation = class {
   constructor(spec, id, deps2) {
     this.id = id;
@@ -1467,6 +1685,12 @@ var Conversation = class {
   started = false;
   nicknames = /* @__PURE__ */ new Map();
   peerNodeId;
+  /** discovery candidates keyed by node id (discovery spec §8) */
+  candidates = /* @__PURE__ */ new Map();
+  /** which relays reported each candidate — feeds the diversity score */
+  candidateRelays = /* @__PURE__ */ new Map();
+  nameService;
+  nsVersion = 0;
   get networkId() {
     return this.spec.network_id;
   }
@@ -1514,6 +1738,10 @@ var Conversation = class {
         this.deps.reputation.record(peer.node_id, "connect");
         this.sendHello(peer.node_id);
         this.mesh?.send(peer.node_id, { t: "SYNC_REQ", chat_vv: this.log.versionVector(), profile_lamport: 0 });
+        this.mesh?.send(peer.node_id, { t: "PEER_TABLE", peers: this.mesh.peerTable(this.myPeerEntry()) });
+        const records = this.nameService?.all() ?? [];
+        if (records.length) this.mesh?.send(peer.node_id, { t: "NS", records: records.slice(0, 64) });
+        void this.persistPeerTable();
         this.deps.onChange(this);
       },
       onPeerClose: (nodeId, reason) => {
@@ -1531,15 +1759,20 @@ var Conversation = class {
     this.pool = new RelayPool({
       urls: this.spec.relays,
       filter: { network_id: this.networkId, target: this.id.myNodeId },
-      onEvent: (event) => void this.handleRelayEvent(event),
+      onEvent: (event, relayUrl) => void this.handleRelayEvent(event, relayUrl),
       onStatus: (_url, connected) => {
         this.deps.onChange(this);
         if (connected) void this.announce();
       }
     });
     this.pool.start();
+    this.nameService = new NameServiceStore(this.networkId);
+    this.nameService.load(await this.deps.store.get("ns", this.networkId) ?? []);
+    await this.loadPeerTable();
     this.timers.push(
       window.setInterval(() => void this.heartbeat(), HEARTBEAT_INTERVAL * 1e3),
+      window.setInterval(() => void this.publishManifest(), 5 * 6e4),
+      window.setInterval(() => void this.persistPeerTable(), 6e4),
       window.setInterval(() => void this.announce(), 24e4),
       window.setInterval(() => {
         this.mesh?.prune(nowSeconds(), HEARTBEAT_TTL * 2);
@@ -1581,11 +1814,20 @@ var Conversation = class {
     }
     this.pool.publish(this.cachedJoin);
   }
+  hbTick = 0;
   async heartbeat() {
     if (!this.pool) return;
+    this.hbTick += 1;
+    const healthy = (this.mesh?.connectedNodeIds().length ?? 0) >= RELAY_INDEPENDENCE_AT;
+    if (healthy && this.hbTick % 2 !== 0) return;
     this.pool.publish(await createHeartbeat(this.networkId, this.id.nodeKeys));
   }
-  async handleRelayEvent(event) {
+  /** True when the mesh is self-sustaining enough to not need the relay for
+   * ongoing discovery (§1.5). Surfaced in the UI. */
+  relayIndependent() {
+    return (this.mesh?.connectedNodeIds().length ?? 0) >= RELAY_INDEPENDENCE_AT;
+  }
+  async handleRelayEvent(event, relayUrl) {
     if (!this.mesh) return;
     if (event.node_id !== this.id.myNodeId && this.deps.reputation.isBanned(event.node_id)) return;
     if (event.type === "JOIN" && event.node_id !== this.id.myNodeId) {
@@ -1593,8 +1835,53 @@ var Conversation = class {
       const ok = await this.acceptMembership(event.pubkey, join.body.invite_chain, join.body.nickname);
       if (!ok) return;
     }
+    if (event.node_id !== this.id.myNodeId && (event.type === "JOIN" || event.type === "HEARTBEAT")) {
+      this.observeCandidate(event, relayUrl);
+    }
+    if (event.type === "LEAVE") {
+      this.candidates.delete(event.node_id);
+      this.candidateRelays.delete(event.node_id);
+    }
+    if (event.type === "MANIFEST") {
+      await this.mergeManifest(event.body.records ?? []);
+    }
     await this.mesh.handleDiscoveryEvent(event);
     this.deps.onChange(this);
+  }
+  /** Fold a JOIN/HEARTBEAT into this node's candidate record (§8.3 Step 4). */
+  observeCandidate(event, relayUrl) {
+    const existing = this.candidates.get(event.node_id);
+    let relays2 = this.candidateRelays.get(event.node_id);
+    if (!relays2) {
+      relays2 = /* @__PURE__ */ new Set();
+      this.candidateRelays.set(event.node_id, relays2);
+    }
+    if (relayUrl) relays2.add(relayUrl);
+    const chain = event.type === "JOIN" ? event.body.invite_chain ?? [] : [];
+    const candidate = {
+      node_id: event.node_id,
+      pubkey: event.pubkey,
+      join_at: event.type === "JOIN" ? Math.max(existing?.join_at ?? 0, event.created_at) : existing?.join_at ?? 0,
+      heartbeat_at: event.type === "HEARTBEAT" ? Math.max(existing?.heartbeat_at ?? 0, event.created_at) : existing?.heartbeat_at ?? 0,
+      relay_count: relays2.size,
+      latency_ms: this.mesh?.peerInfo(event.node_id)?.latency_hint ?? existing?.latency_ms,
+      // §8.3: a candidate whose chain shares our root of trust ranks higher
+      invite_match: this.spec.kind === "invite" ? this.sharesInviteRoot(chain) : true,
+      capabilities: existing?.capabilities
+    };
+    this.candidates.set(event.node_id, candidate);
+  }
+  sharesInviteRoot(chain) {
+    const ourRoot = this.spec.inviteChain?.[0]?.issuer_pubkey;
+    return !!ourRoot && chain[0]?.issuer_pubkey === ourRoot;
+  }
+  /**
+   * Candidates ranked best-first (§8.3 Steps 4-5). The UI and the connection
+   * logic both read this, so "who do we try first" is one deterministic policy.
+   */
+  rankedCandidates(now = nowSeconds()) {
+    const live = [...this.candidates.values()].filter((c) => isViable(c, now));
+    return rankCandidates(live, now);
   }
   async acceptMembership(pubkey, chain, nickname2) {
     let rights;
@@ -1648,7 +1935,41 @@ var Conversation = class {
         if (await nodeIdFromPubkey(msg.pubkey) !== from) return;
         await this.acceptMembership(msg.pubkey, msg.chain ?? [], msg.nickname);
         if (msg.nickname) this.nicknames.set(from, msg.nickname);
+        this.mesh.send(from, { t: "PEER_TABLE", peers: this.mesh.peerTable(this.myPeerEntry()) });
         this.deps.onChange(this);
+        break;
+      }
+      case "PEER_TABLE": {
+        let learned = 0;
+        for (const entry of (msg.peers ?? []).slice(0, 64)) {
+          if (!entry || typeof entry.node_id !== "string" || typeof entry.pubkey !== "string") continue;
+          if (entry.node_id === this.id.myNodeId) continue;
+          if (await nodeIdFromPubkey(entry.pubkey) !== entry.node_id) continue;
+          if (this.deps.reputation.isBanned(entry.node_id)) continue;
+          if (this.mesh.introducePeer(entry)) {
+            learned++;
+            this.candidates.set(entry.node_id, {
+              node_id: entry.node_id,
+              pubkey: entry.pubkey,
+              join_at: entry.last_seen,
+              heartbeat_at: entry.last_seen,
+              relay_count: 0,
+              latency_ms: entry.latency_hint,
+              invite_match: this.spec.kind !== "invite",
+              capabilities: entry.capabilities,
+              via_peer_table: true
+            });
+          }
+        }
+        if (learned) {
+          this.deps.log(`peer table from ${from.slice(0, 8)}: ${learned} new peer(s) (chained discovery)`);
+          await this.persistPeerTable();
+          this.deps.onChange(this);
+        }
+        break;
+      }
+      case "NS": {
+        await this.mergeManifest(msg.records ?? []);
         break;
       }
       case "SYNC_REQ": {
@@ -1771,6 +2092,100 @@ var Conversation = class {
   }
   clearUnread() {
     this.unread = 0;
+  }
+  // ---- Peer table & Name Service (discovery spec §10, §11) ----
+  /** Our own row for the peer table we hand to peers (§10.1). */
+  myPeerEntry() {
+    return {
+      node_id: this.id.myNodeId,
+      pubkey: this.id.pubkeyHex,
+      last_seen: nowSeconds(),
+      capabilities: MY_CAPABILITIES,
+      nickname: this.deps.nickname()
+    };
+  }
+  /** §13: the peer table survives reloads, so a returning node has candidates
+   * before any relay answers. */
+  async persistPeerTable() {
+    if (!this.mesh) return;
+    await this.deps.store.put("peers", `table/${this.networkId}`, this.mesh.peerTable(this.myPeerEntry()));
+  }
+  async loadPeerTable() {
+    const rows = await this.deps.store.get("peers", `table/${this.networkId}`) ?? [];
+    const now = nowSeconds();
+    for (const entry of rows) {
+      if (!entry?.node_id || entry.node_id === this.id.myNodeId) continue;
+      this.mesh?.introducePeer(entry);
+      this.candidates.set(entry.node_id, {
+        node_id: entry.node_id,
+        pubkey: entry.pubkey,
+        join_at: Math.min(entry.last_seen, now),
+        heartbeat_at: 0,
+        relay_count: 0,
+        latency_ms: entry.latency_hint,
+        invite_match: this.spec.kind !== "invite",
+        capabilities: entry.capabilities,
+        via_peer_table: true
+      });
+    }
+    if (rows.length) this.deps.log(`restored ${rows.length} cached peer(s) for ${this.title}`);
+  }
+  /** Merge signed Name Service records (§11.3) from a MANIFEST or a peer. */
+  async mergeManifest(records) {
+    if (!this.nameService) return;
+    let changed = false;
+    for (const record of records.slice(0, 128)) {
+      if (await this.nameService.merge(record)) changed = true;
+    }
+    if (changed) {
+      await this.deps.store.put("ns", this.networkId, this.nameService.all());
+      this.deps.onChange(this);
+    }
+  }
+  /** Announce ourselves in the Name Service and publish a MANIFEST (§11). */
+  async publishManifest() {
+    if (!this.pool || !this.nameService) return;
+    this.nsVersion += 1;
+    const nodeRecord = await createNameRecord(
+      this.networkId,
+      this.id.nodeKeys,
+      `node/${this.id.myNodeId}`,
+      { kind: "node", node_id: this.id.myNodeId, capabilities: MY_CAPABILITIES, nickname: this.deps.nickname() },
+      this.nsVersion,
+      600
+    );
+    await this.nameService.merge(nodeRecord);
+    const serving = [this.id.myNodeId, ...this.mesh?.connectedNodeIds() ?? []].sort();
+    const chatRecord = await createNameRecord(
+      this.networkId,
+      this.id.nodeKeys,
+      `service/chat/${this.id.myNodeId}`,
+      { kind: "node-set", nodes: serving },
+      this.nsVersion,
+      600
+    );
+    await this.nameService.merge(chatRecord);
+    await this.deps.store.put("ns", this.networkId, this.nameService.all());
+    this.pool.publish(
+      await createManifest(this.networkId, this.id.nodeKeys, {
+        relays: this.spec.relays,
+        records: this.nameService.all().slice(0, 64)
+      })
+    );
+  }
+  /** §11.4: resolve a name from the replicated record set (DNS-like). */
+  resolve(name) {
+    return this.nameService?.resolve(name);
+  }
+  /** Nodes advertising a capability, via the Name Service (§11.4). */
+  serviceNodes(capability) {
+    const out = /* @__PURE__ */ new Set();
+    for (const record of this.nameService?.all() ?? []) {
+      const value = record.value;
+      if (value?.kind === "node" && value.capabilities?.includes(capability) && value.node_id) out.add(value.node_id);
+      if (value?.kind === "node-set" && capability === "chat") for (const n of value.nodes ?? []) out.add(n);
+    }
+    return [...out];
   }
   async persistChat() {
     await this.deps.store.put("crdt", `chat/${this.networkId}`, this.log.toJSON());

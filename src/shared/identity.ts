@@ -31,9 +31,29 @@ import type {
   RevocationMap,
   Right,
 } from "./types.js";
+import { PROTOCOL_VERSION } from "./types.js";
 
 /** Hard cap on invite-chain length (verification CPU bound). */
 export const MAX_CHAIN_LENGTH = 16;
+
+/**
+ * Discovery spec §4.2:
+ *   Network ID = SHA-256(GenesisPublicKey ‖ ProtocolVersion ‖ FixedDomainTag)
+ * The version separates incompatible protocol generations; the domain tag
+ * prevents collisions with any other hash of the same key.
+ */
+export const DOMAIN_TAG = "anp-network";
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
 
 /**
  * Open rooms (default mode): a public network anyone can join by knowing the
@@ -82,8 +102,11 @@ export async function dmNetworkId(pubkeyA: PubKeyHex, pubkeyB: PubKeyHex): Promi
   return openNetworkId(dmRoom(pubkeyA, pubkeyB));
 }
 
-export async function networkIdFromGenesisPubkey(genesisPubkeyHex: PubKeyHex): Promise<NetworkId> {
-  return sha256Hex(hexToBytes(genesisPubkeyHex));
+export async function networkIdFromGenesisPubkey(
+  genesisPubkeyHex: PubKeyHex,
+  proto: number = PROTOCOL_VERSION,
+): Promise<NetworkId> {
+  return sha256Hex(concatBytes(hexToBytes(genesisPubkeyHex), utf8Encode(`|${proto}|${DOMAIN_TAG}`)));
 }
 
 export async function nodeIdFromPubkey(pubkeyHex: PubKeyHex): Promise<NodeId> {
@@ -123,6 +146,7 @@ export async function issueCertificate(opts: IssueCertOptions): Promise<InviteCe
     rights: opts.rights,
     issued_at: issuedAt,
     expires_at: issuedAt + (opts.ttl ?? 30 * 24 * 3600),
+    nonce: randomHex(8), // §5.2: distinguishes otherwise-identical certificates
     revoked: false,
     signature: "",
   };
