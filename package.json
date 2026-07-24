@@ -8,8 +8,8 @@
     "build": "npm run typecheck && node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "relay": "tsx src/relay/server.ts",
-    "serve": "node dist/relay.mjs",
-    "start": "npm run build && npm run relay",
+    "start": "node server.mjs",
+    "dev": "npm run build && npm run relay",
     "test": "node --import tsx --test test/*.test.ts",
     "test:e2e": "node test/e2e.browser.mjs"
   },

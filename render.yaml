@@ -15,7 +15,7 @@ services:
     runtime: node
     plan: free
     buildCommand: npm ci && npm run build
-    startCommand: npm run serve
+    startCommand: node server.mjs
     envVars:
       # Render provides PORT and terminates TLS at its proxy, so trust the
       # forwarded client IP for per-IP rate limiting.

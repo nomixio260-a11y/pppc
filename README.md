@@ -13,127 +13,44 @@
        → 署名付きCRDTでメッセージ同期（DMは本文も暗号化）
 ```
 
-## 📱 スマホだけで使う（`npm` 不要・PC不要）
+## 使い方（これだけ）
 
-スマホしかない・ローカルで `npm install` したくない場合は、**Webから一度デプロイして、あとはURLを開くだけ**にできます。フロントと Relay は同じプロセスなので、**1つのURLでチャットが完結**します。
+**必要なのは [Node.js](https://nodejs.org)（v20以上）だけ。** インストール不要・外部サービス不要・設定不要です。
 
-### 方法A: Render に1回デプロイ（常設・おすすめ）
+1. このリポジトリを **ZIPでダウンロード**して解凍（または `git clone`）。
+2. フォルダ内の**ランチャーをダブルクリック**：
+   - **Windows** → `start.bat`
+   - **Mac** → `start.command`
+   - **Linux** → `./start.sh`（またはターミナルで `node server.mjs`）
+3. 自動でローカルのRelayが立ち上がり、**ブラウザが開いてすぐチャット画面**になります（`http://localhost:8787/`）。表示名を入れて完了。
 
-1. GitHub でこのリポジトリを **Fork**（スマホのブラウザ/GitHubアプリで可）。
-2. [Render](https://dashboard.render.com) にログイン → **New → Blueprint** → 自分のForkを選択。
-   リポジトリ同梱の `render.yaml` を読んで自動でビルド＆デプロイします（無料プランでOK）。
-3. できあがった **`https://<名前>.onrender.com/`** をスマホのブラウザで開く → 表示名を入れて完了。
-4. 同じURLを友達に送れば、その人もスマホで開くだけで同じチャンネルに入れます。
+> リポジトリにはビルド済みのフロント（`public/`）と1ファイルのRelay（`server.mjs`）が同梱されているので、`npm install` もビルドも不要です。中身は `node server.mjs` を実行しているだけ。
 
-> 無料プランはアクセスが無いとスリープし、初回だけ ~30秒 起動待ちがあります。Railway / Fly.io / Deno Deploy などでも `npm run build` → `node dist/relay.mjs`（`PORT` は各社が自動指定、`ANP_TRUST_PROXY=1` 推奨）で同様に動きます。
+### もう1人（同じPC内）で試す
 
-### 方法B: GitHub Actions の一時デモ（デプロイ設定すら不要）
+もう1つ**別のブラウザ、またはシークレット/プライベートウィンドウ**で `http://localhost:8787/` を開くだけ。別ユーザーになり、同じ `#general` で自動的につながってチャットできます。DMは、片方で歯車→「あなたのID」をコピー → もう片方の「✉ DM」に貼り付けて開始。
 
-GitHub の **Actions → "ANP Demo (Cloudflare Tunnel)" → Run workflow**（スマホのGitHubアプリ/ブラウザから実行可）を押すと、数分後にジョブサマリーに **`https://….trycloudflare.com`** が出ます。それをスマホで開けば即チャット。指定した分数で自動停止します。
-（「Run workflow」ボタンは、ワークフローがデフォルトブランチにある時だけ表示されます。無い場合は方法Aを使ってください。）
+### 別の端末・スマホからも使いたい場合（任意）
 
-### 方法C: 既にRelayがあるなら、リンクを開くだけ
+ブラウザの暗号機能（Web Crypto / WebRTC）は **`localhost` か `https`** でしか動かないため、`http://<PCのIP>` で他端末から開いても動きません。他端末やスマホからも使いたいときだけ、`https` で公開する必要があります。リポジトリには任意で使える補助を同梱しています（**使わなくても上のローカル利用は完結します**）：
 
-どこかにフロントを置いてあり Relay のURLが分かっているなら、**`https://フロント/#relay=wss://Relayのアドレス`** という形のリンクを開くだけで、そのRelayに自動接続します（スマホでの共有に便利）。
+- `render.yaml` … [Render](https://render.com) 等に載せると常設の `https://…` URL になります（Web操作のみ・無料枠可）。
+- GitHub Actions の "ANP Demo (Cloudflare Tunnel)" … 一時的な公開URLを発行します。
 
----
-
-## 起動方法（PCでローカル実行する場合）
-
-**必要なもの**: Node.js 20 以上（推奨 22）。ブラウザは Chrome / Edge / Safari / Firefox の最新版。
-
-```bash
-# 1. 取得して依存をインストール
-git clone <このリポジトリ> && cd pppc
-npm install
-
-# 2. ビルドして Relay（＋フロント配信）を起動
-npm start
-#   → コンソールに次のように表示されれば成功:
-#     [anp-relay] listening on http://0.0.0.0:8787
-#     [anp-relay] client UI    http://localhost:8787/
-
-# 3. ブラウザで開く
-#     http://localhost:8787/
-```
-
-- `npm start` は「型チェック → フロントのビルド → Relay起動」をまとめて実行します。
-- 開発中にフロントだけ作り直したいときは `npm run build`、Relay だけ再起動は `npm run relay`。
-- ポートを変えたいときは `PORT=9000 npm start`（UIは `http://localhost:9000/`）。
-
-**画面の使い方**
-
-1. 開いたら**表示名**を入れて「はじめる」。自動で `#general` に入ります。
-2. 左のサイドバーが会話一覧。**「＃ チャンネル」**で公開ルームを作成/参加、**「✉ DM」**で1対1を開始。
-3. 同じ Relay につないだ人が同じチャンネルを開くと自動で接続し、チャットできます。
-
-### 手早く「2人」で試す
-
-1台のPCでも、**別々のブラウザ or シークレットウィンドウ**で `http://localhost:8787/` を2つ開けば2人分になります（保存領域がプロファイルごとに分かれるため別ユーザー扱い）。
-
-- 両方で表示名を入れて開始 → 両方 `#general` に入る → 数秒で「◯人と接続中」になり、片方で送ったメッセージがもう片方に届きます。
-- **DMを試す**: 一方で歯車（設定）→「あなたのID」をコピー → もう一方の「✉ DM」に貼り付けて開始。両者がお互いをDMに追加すると1対1の暗号チャットになります。
-
-> うまくつながらないときは、両方が**同じ Relay**（＝同じ `http://localhost:8787/`）を開いているか、コンソールに Relay の `listening` が出ているかを確認してください。
-
-### 📱 スマホでの使い方
-
-スマホのブラウザ（iOS Safari / Android Chrome）で、PCで動かしている Relay の URL を開くだけです。
-
-1. **Relay を公開URLで用意する**（どれか）
-   - 手軽: GitHub の **Actions → "ANP Demo (Cloudflare Tunnel)"** を実行 → 表示された `https://….trycloudflare.com` をスマホで開く（下記デモ参照）
-   - 自前: どこか（VPS等）で `npm start` し、`https://` で公開（スマホの WebRTC/Web Crypto は **https 必須**）
-2. スマホのブラウザでその URL を開く → 表示名を入れて「はじめる」
-3. **画面はスマホ最適化**: 一覧をタップすると会話が全画面で開き、左上の「←」で一覧に戻る。下部の入力欄からメッセージ送信、📎でファイル共有。
-4. **友達を招く**: チャンネルの共有ボタン（右上）で `#channel=名前` 付きリンクをコピー/共有 → 相手が開けば同じチャンネルへ。DM は設定（歯車）→「あなたのID」を相手に渡し、相手のIDで「✉ DM」から開始。
-5. ホーム画面に追加すればアプリのように起動できます（PWA 相当の全画面表示・セーフエリア対応済み）。
-
-> スマホは `https`（またはlocalhost）でないと Web Crypto / WebRTC が動きません。`http://<PCのIP>` 直アクセスでは動かない点に注意（Cloudflare Tunnel を使えば https で解決）。
-
-### フロントだけをダウンロードして配布する
-
-`npm run build` で **`dist/`** フォルダ（`index.html` + `styles.css` + `anp.js` + 単一ファイル版 `anp.html` + 説明書）が生成されます。これがフロント一式です。
-
-- 任意の静的ホスティング（GitHub Pages / Netlify / `npx serve` / nginx …）に `dist/` を置き、Relay を指定すれば動きます。
-- GitHub の Actions 実行結果 → Artifacts の **`anp-frontend`**（フロント一式のzip）／**`anp-single-file-html`**（`anp.html` 単体）からダウンロードできます。
-- 注: 複数ファイル版はブラウザのモジュール制約で `file://` 直開きはできません（http(s) 配信が必要）。`file://` で開きたい場合は単一ファイルの `anp.html` を使ってください。
-
-### 公開デモ（GitHub Actions + Cloudflare Tunnel）
-
-中央サーバーを常設せずに、一時的な公開デモを起動できる。GitHub の **Actions → "ANP Demo (Cloudflare Tunnel)" → Run workflow** を実行すると、Actions ランナー内で Relay が起動し、Cloudflare Tunnel 経由で公開URL（`https://<ランダム>.trycloudflare.com`）がジョブサマリーに表示される。そのURLを複数のブラウザ/プロファイルで開けば招待制P2Pネットワークを試せる。指定した分数が過ぎるとトンネルは自動停止する。
-
-> **「Run workflow」ボタンが出ない場合**: `workflow_dispatch` のワークフローは、そのファイルが**デフォルトブランチ（main等）に存在する場合のみ** Actions UI に手動実行ボタンが表示される、というGitHubの仕様。作業ブランチのままでは出ない。デフォルトブランチにこのブランチをマージ（またはワークフローファイルを取り込み）すればボタンが現れる。マージ前でも、`push` で走る **CI** ワークフローが毎回 `anp.html` を Artifacts に上げるので、そこからダウンロードしてローカルで開けば（上記「最短で試す」）サーバーなしで試せる。
-
-- 難易度と起動時間は Run workflow の入力で指定
-- 安定したホスト名が欲しい場合はリポジトリシークレット `CF_TUNNEL_TOKEN`（named tunnel のトークン）と変数 `CF_PUBLIC_URL` を設定
-- ローカルでも同じことができる: `cloudflared` を入れて `DURATION=1800 bash scripts/demo.sh`
-
-Tunnel の背後では全クライアントが同一送信元IPに見えるため、Relay は `ANP_TRUST_PROXY=1` のとき `CF-Connecting-IP` / `X-Forwarded-For` を使ってIP毎レート制限を正しく効かせる（直接公開時はヘッダを信用しない安全側がデフォルト）。`scripts/demo.sh` はトンネルがエッジに接続登録されるまで待ってからURLを提示するので、到達不能なURLを渡さない。
-
-> 注: cloudflared はエッジ接続に outbound port 7844（QUIC/TCP）を使う。GitHub Actions ランナーはこれを許可するが、ポート7844を塞ぐ制限環境ではトンネルが張れずスクリプトが明示エラーで停止する（その場合はビルド・Relay・URL発行までは確認できる）。
-
-別の端末やブラウザプロファイル（シークレットウィンドウ等）で同じ Relay を開くと、それぞれ独立ユーザーになり、同じチャンネル/相互DMで接続します（IndexedDB がプロファイルごとに分かれる）。
-
-- 難易度と起動時間は Run workflow の入力で指定
-- 安定したホスト名が欲しい場合はリポジトリシークレット `CF_TUNNEL_TOKEN`（named tunnel のトークン）と変数 `CF_PUBLIC_URL` を設定
-- ローカルでも同じことができる: `cloudflared` を入れて `DURATION=1800 bash scripts/demo.sh`
-
-Tunnel の背後では全クライアントが同一送信元IPに見えるため、Relay は `ANP_TRUST_PROXY=1` のとき `CF-Connecting-IP` / `X-Forwarded-For` を使ってIP毎レート制限を正しく効かせる（直接公開時はヘッダを信用しない安全側がデフォルト）。
-
-> **「Run workflow」ボタンが出ない場合**: `workflow_dispatch` はワークフローファイルが**デフォルトブランチに存在する場合のみ**手動実行ボタンが出る、というGitHubの仕様。マージ前でも `push` で走る **CI** が `anp-frontend`（フロント一式）と `anp.html` を Artifacts に上げるので、そこから取得できる。
-> cloudflared はエッジ接続に outbound port 7844（QUIC/TCP）を使う。ポート7844を塞ぐ環境ではトンネルが張れず、`scripts/demo.sh` は明示エラーで停止する。
+いずれも**任意**で、ローカルで使うだけなら不要です。
 
 ## コマンド
 
 | コマンド | 説明 |
 |---|---|
-| `npm run build` | 型チェック + フロントビルド + 本番用Relay `dist/relay.mjs` + 配布`dist/` |
-| `npm run relay` | Relay 起動（開発・tsx）（`PORT`/`HOST`/`ANP_POW_BITS`/`ANP_TRUST_PROXY`/`ANP_PUBLIC_DIR`） |
-| `npm run serve` | 本番用Relay 起動（`node dist/relay.mjs`・devDependencies不要、ホスティング向け） |
-| `npm start` | build + relay |
-| `npm test` | ユニット + Relay 統合テスト（70件） |
+| **`node server.mjs`** | **同梱の自己完結Relay（＝フロント配信込み）を起動。これだけで動く**（`npm start` も同じ） |
+| `start.bat` / `start.command` / `start.sh` | 上記＋ブラウザ自動起動（ダブルクリック用） |
+| `npm run build` | ソースから再ビルド（`server.mjs`・`public/anp.js`・単一`anp.html`・配布`dist/` を再生成、開発時のみ） |
+| `npm run dev` | 開発用（build → tsx でRelay起動） |
+| `npm test` | ユニット + Relay 統合テスト（70件、要 `npm install`） |
 | `npm run test:e2e` | 実ブラウザE2E（チャンネル自動探索 + 暗号DM、要 Chromium） |
-| `bash scripts/demo.sh` | Relay起動 + Cloudflare Tunnel で公開 |
+
+環境変数: `PORT`（既定8787）/ `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY`（プロキシ背後で1）/ `ANP_OPEN`（1でブラウザ自動起動）/ `ANP_PUBLIC_DIR`。
 
 ## 構成
 

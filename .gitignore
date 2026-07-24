@@ -1,6 +1,11 @@
 node_modules/
-public/anp.js
 public/anp.js.map
 dist/
 .demo-url
 cloudflared
+
+# Committed build outputs (so the repo runs with just `node server.mjs`, no
+# npm install). Regenerate with `npm run build`.
+#   - server.mjs        (self-contained relay)
+#   - public/anp.js      (frontend bundle)
+#   - public/anp.html    (single-file frontend)

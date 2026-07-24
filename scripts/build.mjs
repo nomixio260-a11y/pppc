@@ -13,21 +13,21 @@ await build({
 });
 console.log("[build] public/anp.js written");
 
-// 1b) Relay bundled to plain JS so production hosts (Render etc.) can run it
-//     with `node dist/relay.mjs` — no tsx / devDependencies at runtime.
-await mkdir("dist", { recursive: true });
+// 1b) Relay bundled to ONE self-contained JS file committed at the repo root,
+//     so `node server.mjs` runs with just Node — no npm install, no tsx, no
+//     devDependencies at runtime (ws is inlined).
 await build({
   entryPoints: ["src/relay/server.ts"],
   bundle: true,
   platform: "node",
   format: "esm",
   target: "node20",
-  outfile: "dist/relay.mjs",
+  outfile: "server.mjs",
   // ws pulls in optional native speedups that aren't needed (pure-JS fallback)
   external: ["bufferutil", "utf-8-validate"],
   banner: { js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
 });
-console.log("[build] dist/relay.mjs written (production relay)");
+console.log("[build] server.mjs written (self-contained relay — run with: node server.mjs)");
 
 // 2) Single self-contained file: inline the (minified) JS and CSS into one
 //    HTML so it works when opened straight from disk (file://), with no

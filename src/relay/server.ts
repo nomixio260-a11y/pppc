@@ -554,9 +554,22 @@ setInterval(() => {
 }, PING_INTERVAL_MS).unref();
 
 httpServer.listen(PORT, HOST, () => {
-  console.log(`[anp-relay] listening on http://${HOST}:${PORT}`);
-  console.log(`[anp-relay] ws endpoint  ws://${HOST}:${PORT}`);
-  console.log(`[anp-relay] client UI    http://localhost:${PORT}/`);
-  console.log(`[anp-relay] join PoW     ${POW_REQUIRED_BITS} bits`);
-  console.log(`[anp-relay] trust proxy  ${TRUST_PROXY}`);
+  const url = `http://localhost:${PORT}/`;
+  console.log(`\n  ✅ ANP Chat が起動しました → ${url}\n`);
+  console.log(`[anp-relay] listening http://${HOST}:${PORT}  (PoW ${POW_REQUIRED_BITS} bits, trust-proxy ${TRUST_PROXY})`);
+  // ANP_OPEN=1 (set by the double-click launchers) opens the browser for a
+  // zero-friction "download and run" experience. No-op on servers.
+  if (process.env.ANP_OPEN === "1") openBrowser(url);
 });
+
+async function openBrowser(url: string): Promise<void> {
+  try {
+    const { spawn } = await import("node:child_process");
+    const cmd =
+      process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+    const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+    spawn(cmd, args, { stdio: "ignore", detached: true }).unref();
+  } catch {
+    /* headless / no browser — fine */
+  }
+}
