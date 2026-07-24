@@ -23804,50 +23804,67 @@ httpServer.listen(PORT, HOST, () => {
   if (process.env.ANP_OPEN === "1") openBrowser(local);
   if (process.env.ANP_HTTPS === "0" || TRUST_PROXY) return;
   const ip = lanIp();
-  if (!ip) return;
-  void startLanHttps(ip);
+  const publicHost = process.env.ANP_PUBLIC_HOST;
+  if (!ip && !publicHost && !process.env.ANP_TLS_CERT) return;
+  void startHttps(ip, publicHost);
 });
-async function startLanHttps(ip) {
+var isIp = (s) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
+async function startHttps(lan, publicHost) {
   try {
-    const selfsigned = (await Promise.resolve().then(() => __toESM(require_selfsigned(), 1))).default;
-    const httpsPort = PORT + 1;
-    const pems = await selfsigned.generate([{ name: "commonName", value: ip }], {
-      days: 3650,
-      keySize: 2048,
-      extensions: [
-        {
-          name: "subjectAltName",
-          altNames: [
-            { type: 7, ip },
-            // IP
-            { type: 7, ip: "127.0.0.1" },
-            { type: 2, value: "localhost" }
-            // DNS
-          ]
-        }
-      ]
-    });
-    const httpsServer = createHttpsServer({ key: pems.private, cert: pems.cert }, handleHttp);
+    const httpsPort = Number(process.env.ANP_HTTPS_PORT ?? PORT + 1);
+    let key;
+    let cert;
+    if (process.env.ANP_TLS_CERT && process.env.ANP_TLS_KEY) {
+      cert = await readFile(process.env.ANP_TLS_CERT, "utf8");
+      key = await readFile(process.env.ANP_TLS_KEY, "utf8");
+    } else {
+      const selfsigned = (await Promise.resolve().then(() => __toESM(require_selfsigned(), 1))).default;
+      const altNames = [
+        { type: 7, ip: "127.0.0.1" },
+        { type: 2, value: "localhost" }
+      ];
+      if (lan) altNames.push({ type: 7, ip: lan });
+      if (publicHost) altNames.push(isIp(publicHost) ? { type: 7, ip: publicHost } : { type: 2, value: publicHost });
+      const cn = publicHost ?? lan ?? "localhost";
+      const pems = await selfsigned.generate([{ name: "commonName", value: cn }], {
+        days: 3650,
+        keySize: 2048,
+        extensions: [{ name: "subjectAltName", altNames }]
+      });
+      key = pems.private;
+      cert = pems.cert;
+    }
+    const httpsServer = createHttpsServer({ key, cert }, handleHttp);
     attachWs(httpsServer);
     httpsServer.on("error", () => {
     });
     httpsServer.listen(httpsPort, "0.0.0.0", async () => {
-      const lanUrl = `https://${ip}:${httpsPort}/`;
-      console.log(`[anp-relay] https ${ip}:${httpsPort}  (LAN / \u30B9\u30DE\u30DB\u7528\u30FB\u81EA\u5DF1\u7F72\u540D)
+      const selfSigned = !(process.env.ANP_TLS_CERT && process.env.ANP_TLS_KEY);
+      const lanUrl = lan ? `https://${lan}:${httpsPort}/` : void 0;
+      const pubUrl = publicHost ? `https://${publicHost}:${httpsPort}/` : void 0;
+      const warn = selfSigned ? "\uFF08\u521D\u56DE\u306E\u307F\u8A3C\u660E\u66F8\u306E\u8B66\u544A\u3092\u300C\u7D9A\u884C/\u30A2\u30AF\u30BB\u30B9\u3059\u308B\u300D\uFF09" : "";
+      console.log(`[anp-relay] https :${httpsPort}  (${selfSigned ? "\u81EA\u5DF1\u7F72\u540D" : "\u6301\u3061\u8FBC\u307F\u8A3C\u660E\u66F8"})
 `);
-      console.log(`  \u{1F4F1} \u540C\u3058Wi-Fi\u306E\u30B9\u30DE\u30DB\u304B\u3089\u4F7F\u3046\u306B\u306F\u3001\u4E0B\u306EURL\u3092\u958B\u3044\u3066\u304F\u3060\u3055\u3044\uFF08\u521D\u56DE\u306E\u307F\u8A3C\u660E\u66F8\u306E\u8B66\u544A\u3092\u300C\u7D9A\u884C/\u30A2\u30AF\u30BB\u30B9\u3059\u308B\u300D\uFF09:`);
-      console.log(`     ${lanUrl}
+      if (lanUrl) {
+        console.log(`  \u{1F4F1} \u540C\u3058Wi-Fi\u306E\u30B9\u30DE\u30DB/PC\u304B\u3089: ${lanUrl}  ${warn}`);
+      }
+      if (pubUrl) {
+        console.log(`  \u{1F30D} \u5225\u30CD\u30C3\u30C8\u30EF\u30FC\u30AF\u304B\u3089\uFF08\u8981\u30DD\u30FC\u30C8\u958B\u653E / \u516C\u958BIP\u30FB\u30C9\u30E1\u30A4\u30F3\uFF09: ${pubUrl}  ${warn}`);
+      }
+      console.log("");
+      const qrUrl = pubUrl ?? lanUrl;
+      if (qrUrl) {
+        try {
+          const qrcode = (await Promise.resolve().then(() => __toESM(require_main(), 1))).default;
+          qrcode.generate(qrUrl, { small: true });
+          console.log(`  \u2191 \u30B9\u30DE\u30DB\u306E\u30AB\u30E1\u30E9\u3067\u3053\u306EQR\u3092\u8AAD\u307F\u53D6\u3063\u3066\u3082OK
 `);
-      try {
-        const qrcode = (await Promise.resolve().then(() => __toESM(require_main(), 1))).default;
-        qrcode.generate(lanUrl, { small: true });
-        console.log(`  \u2191 \u30B9\u30DE\u30DB\u306E\u30AB\u30E1\u30E9\u3067\u3053\u306EQR\u3092\u8AAD\u307F\u53D6\u3063\u3066\u3082OK
-`);
-      } catch {
+        } catch {
+        }
       }
     });
   } catch (err) {
-    console.log(`[anp-relay] LAN https \u3092\u8D77\u52D5\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F: ${err.message}`);
+    console.log(`[anp-relay] https \u3092\u8D77\u52D5\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F: ${err.message}`);
   }
 }
 async function openBrowser(url) {

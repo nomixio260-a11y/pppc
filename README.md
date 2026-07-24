@@ -46,9 +46,29 @@ PCで起動すると、コンソールに**スマホ用のURLとQRコード**が
 
 もう1つ**別のブラウザ、またはシークレット/プライベートウィンドウ**で `http://localhost:8787/` を開くだけ。別ユーザーになり、同じ `#general` で自動的につながります。DMは、片方で歯車→「あなたのID」をコピー → もう片方の「✉ DM」に貼り付けて開始。
 
-### インターネット越し（別のWi-Fi）でも使いたい場合（任意）
+### 別のWi-Fi / インターネット越しでも使いたい場合
 
-同じWi-Fiでない相手とつなぐときだけ、公開URLが必要です。リポジトリに任意の補助を同梱していますが、**使わなくても上記のローカル/同一Wi-Fi利用は完結します**：`render.yaml`（Renderに載せると常設 `https://…`）や GitHub Actions の "ANP Demo (Cloudflare Tunnel)"（一時URL）。
+**同じWi-Fi限定ではありません。** ただし別ネットワークの相手とつなぐには、Relay を「外から届く場所」にする必要があります（家のPCはインターネットからは直接見えないため）。外部サービスの少ない順に：
+
+**A. ルーターのポート開放（外部サービス不要）** — ルーターで https ポートを自分のPCに転送し、公開IP/ドメインを指定して起動：
+
+```bash
+# 例: ルーターで 443 → このPCの 8443 を転送している場合
+ANP_PUBLIC_HOST=あなたの公開IPまたはドメイン ANP_HTTPS_PORT=8443 node server.mjs
+```
+
+起動時に **`🌍 別ネットワークから: https://<公開ホスト>:<ポート>/`** が表示されます。相手はそれを開くだけ（自己署名なので初回だけ証明書警告を許可）。※ISPが公開IPをくれる環境が必要（CGNATだと不可）。
+
+**B. 自分のドメイン＋正規証明書（警告なし・外部サービスほぼ不要）** — 証明書ファイルを渡せば、ブラウザ警告なしで使えます：
+
+```bash
+ANP_PUBLIC_HOST=chat.example.com ANP_HTTPS_PORT=443 \
+  ANP_TLS_CERT=/path/fullchain.pem ANP_TLS_KEY=/path/privkey.pem  node server.mjs
+```
+
+**C. トンネル / ホスティング（“経路”だけ外部）** — 一番手軽。`render.yaml`（Renderに載せると常設 `https://…`）や GitHub Actions の "ANP Demo (Cloudflare Tunnel)"（一時URL）。Relay 自体は自分のもので、届く経路だけ借ります。
+
+> 補足: 異なるNATの奥同士のP2P直結は STUN（Google公開STUNを既定使用）で多くは成功しますが、対称NAT等の一部環境では直結できないことがあります（本実装は TURN 中継サーバーを使いません）。その場合もRelay経由の発見・シグナリングは動きます。
 
 ## コマンド
 
@@ -61,7 +81,7 @@ PCで起動すると、コンソールに**スマホ用のURLとQRコード**が
 | `npm test` | ユニット + Relay 統合テスト（70件、要 `npm install`） |
 | `npm run test:e2e` | 実ブラウザE2E（チャンネル自動探索 + 暗号DM、要 Chromium） |
 
-環境変数: `PORT`（既定8787、スマホ用httpsは `PORT+1`）/ `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY`（プロキシ背後で1・その場合LAN httpsは自動オフ）/ `ANP_OPEN`（1でブラウザ自動起動）/ `ANP_HTTPS`（0でLAN https/QRを無効）/ `ANP_PUBLIC_DIR`。
+環境変数: `PORT`（既定8787）/ `ANP_HTTPS_PORT`（既定 `PORT+1`）/ `ANP_PUBLIC_HOST`（公開IP/ドメイン）/ `ANP_TLS_CERT`・`ANP_TLS_KEY`（正規証明書の持ち込み）/ `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY`（プロキシ背後で1・その場合内蔵httpsは自動オフ）/ `ANP_OPEN`（1でブラウザ自動起動）/ `ANP_HTTPS`（0で内蔵https/QRを無効）/ `ANP_PUBLIC_DIR`。
 
 ## 構成
 

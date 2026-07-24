@@ -578,56 +578,81 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[anp-relay] listening http ${HOST}:${PORT}  (PoW ${POW_REQUIRED_BITS} bits, trust-proxy ${TRUST_PROXY})`);
   if (process.env.ANP_OPEN === "1") openBrowser(local);
 
-  // LAN HTTPS: lets phones/other devices on the same Wi-Fi use it. Browsers
-  // block Web Crypto/WebRTC over plain http (except localhost), so we serve
-  // https with a self-signed cert. Off when behind a real proxy (hosted) or
-  // ANP_HTTPS=0. This uses NO external service — the cert is generated locally.
+  // HTTPS: browsers block Web Crypto/WebRTC over plain http (except localhost),
+  // so we serve the app over https for other devices. NO external service —
+  // the cert is generated locally (or supply your own real cert). Off behind a
+  // real proxy (hosted, which already terminates TLS) or ANP_HTTPS=0.
   if (process.env.ANP_HTTPS === "0" || TRUST_PROXY) return;
   const ip = lanIp();
-  if (!ip) return;
-  void startLanHttps(ip);
+  const publicHost = process.env.ANP_PUBLIC_HOST; // a domain or public IP (for port-forwarding / internet use)
+  if (!ip && !publicHost && !process.env.ANP_TLS_CERT) return;
+  void startHttps(ip, publicHost);
 });
 
-async function startLanHttps(ip: string): Promise<void> {
+const isIp = (s: string): boolean => /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
+
+async function startHttps(lan: string | undefined, publicHost: string | undefined): Promise<void> {
   try {
-    // selfsigned's typings vary across versions; call through `any` and await
-    // in case it returns a promise (v5+). No external service — local cert.
-    const selfsigned = (await import("selfsigned")).default as unknown as {
-      generate: (attrs: unknown, opts: unknown) => { private: string; cert: string } | Promise<{ private: string; cert: string }>;
-    };
-    const httpsPort = PORT + 1;
-    const pems = await selfsigned.generate([{ name: "commonName", value: ip }], {
-      days: 3650,
-      keySize: 2048,
-      extensions: [
-        {
-          name: "subjectAltName",
-          altNames: [
-            { type: 7, ip }, // IP
-            { type: 7, ip: "127.0.0.1" },
-            { type: 2, value: "localhost" }, // DNS
-          ],
-        },
-      ],
-    });
-    const httpsServer = createHttpsServer({ key: pems.private, cert: pems.cert }, handleHttp);
+    const httpsPort = Number(process.env.ANP_HTTPS_PORT ?? PORT + 1);
+    let key: string;
+    let cert: string;
+
+    if (process.env.ANP_TLS_CERT && process.env.ANP_TLS_KEY) {
+      // bring-your-own real certificate (e.g. your domain) — no browser warning
+      cert = await readFile(process.env.ANP_TLS_CERT, "utf8");
+      key = await readFile(process.env.ANP_TLS_KEY, "utf8");
+    } else {
+      // locally-generated self-signed cert covering localhost, the LAN IP and
+      // any public host you set (so port-forwarding to your IP/domain works)
+      const selfsigned = (await import("selfsigned")).default as unknown as {
+        generate: (attrs: unknown, opts: unknown) => { private: string; cert: string } | Promise<{ private: string; cert: string }>;
+      };
+      const altNames: Array<{ type: number; ip?: string; value?: string }> = [
+        { type: 7, ip: "127.0.0.1" },
+        { type: 2, value: "localhost" },
+      ];
+      if (lan) altNames.push({ type: 7, ip: lan });
+      if (publicHost) altNames.push(isIp(publicHost) ? { type: 7, ip: publicHost } : { type: 2, value: publicHost });
+      const cn = publicHost ?? lan ?? "localhost";
+      const pems = await selfsigned.generate([{ name: "commonName", value: cn }], {
+        days: 3650,
+        keySize: 2048,
+        extensions: [{ name: "subjectAltName", altNames }],
+      });
+      key = pems.private;
+      cert = pems.cert;
+    }
+
+    const httpsServer = createHttpsServer({ key, cert }, handleHttp);
     attachWs(httpsServer);
-    httpsServer.on("error", () => {}); // e.g. port busy — ignore, http still works
+    httpsServer.on("error", () => {}); // port busy etc. — ignore, http still works
     httpsServer.listen(httpsPort, "0.0.0.0", async () => {
-      const lanUrl = `https://${ip}:${httpsPort}/`;
-      console.log(`[anp-relay] https ${ip}:${httpsPort}  (LAN / スマホ用・自己署名)\n`);
-      console.log(`  📱 同じWi-Fiのスマホから使うには、下のURLを開いてください（初回のみ証明書の警告を「続行/アクセスする」）:`);
-      console.log(`     ${lanUrl}\n`);
-      try {
-        const qrcode = (await import("qrcode-terminal")).default;
-        qrcode.generate(lanUrl, { small: true });
-        console.log(`  ↑ スマホのカメラでこのQRを読み取ってもOK\n`);
-      } catch {
-        /* qr optional */
+      const selfSigned = !(process.env.ANP_TLS_CERT && process.env.ANP_TLS_KEY);
+      const lanUrl = lan ? `https://${lan}:${httpsPort}/` : undefined;
+      const pubUrl = publicHost ? `https://${publicHost}:${httpsPort}/` : undefined;
+      const warn = selfSigned ? "（初回のみ証明書の警告を「続行/アクセスする」）" : "";
+      console.log(`[anp-relay] https :${httpsPort}  (${selfSigned ? "自己署名" : "持ち込み証明書"})\n`);
+      if (lanUrl) {
+        console.log(`  📱 同じWi-Fiのスマホ/PCから: ${lanUrl}  ${warn}`);
+      }
+      if (pubUrl) {
+        console.log(`  🌍 別ネットワークから（要ポート開放 / 公開IP・ドメイン）: ${pubUrl}  ${warn}`);
+      }
+      console.log("");
+      // QR of the most "reachable" URL to open on a phone
+      const qrUrl = pubUrl ?? lanUrl;
+      if (qrUrl) {
+        try {
+          const qrcode = (await import("qrcode-terminal")).default;
+          qrcode.generate(qrUrl, { small: true });
+          console.log(`  ↑ スマホのカメラでこのQRを読み取ってもOK\n`);
+        } catch {
+          /* qr optional */
+        }
       }
     });
   } catch (err) {
-    console.log(`[anp-relay] LAN https を起動できませんでした: ${(err as Error).message}`);
+    console.log(`[anp-relay] https を起動できませんでした: ${(err as Error).message}`);
   }
 }
 
