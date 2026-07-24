@@ -103,7 +103,17 @@ async function copy(text: string, okMsg: string): Promise<void> {
     toast("コピーできませんでした", "error");
   }
 }
+/** A relay URL provided in the page URL (?relay=… or #relay=…). Lets a hosted
+ * frontend be pointed at any relay by sharing one link — handy on phones. */
+function urlRelay(): string | undefined {
+  const q = new URLSearchParams(location.search).get("relay");
+  const h = /[#&]relay=([^&]+)/.exec(location.hash);
+  const raw = q ?? (h ? decodeURIComponent(h[1]!) : undefined);
+  return raw && /^wss?:\/\//.test(raw) ? raw : undefined;
+}
 function defaultRelays(): string[] {
+  const fromUrl = urlRelay();
+  if (fromUrl) return [fromUrl];
   if (location.protocol.startsWith("http")) {
     return [`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`];
   }
@@ -398,7 +408,11 @@ async function boot(): Promise<void> {
   const stored = await store.get<StoredKeyPair>("kv", "identityKeys");
   if (!stored) {
     ($("welcome-nick") as HTMLInputElement).value ||= autoNickname();
-    $("welcome-relay-field").hidden = location.protocol.startsWith("http");
+    const forced = urlRelay();
+    if (forced) ($("welcome-relay") as HTMLInputElement).value = forced;
+    // hide the relay field only when a same-origin default is usable (http and
+    // no explicit relay); show it for file:// or when a relay link was given
+    $("welcome-relay-field").hidden = location.protocol.startsWith("http") && !forced;
     $("welcome").hidden = false;
     $("layout").hidden = true;
     return;
@@ -408,6 +422,13 @@ async function boot(): Promise<void> {
   reputation.onChange = (r) => void store.put("peers", r.node_id, r);
   nickname = (await store.get<string>("kv", "nickname")) ?? autoNickname();
   relays = (await store.get<string[]>("kv", "relays")) ?? defaultRelays();
+  // a relay passed in the URL (?relay=… / #relay=…) overrides the stored one,
+  // so a single shared link can point a returning user at a new relay
+  const forced = urlRelay();
+  if (forced && !relays.includes(forced)) {
+    relays = [forced, ...relays];
+    await store.put("kv", "relays", relays);
+  }
 
   $("welcome").hidden = true;
   $("layout").hidden = false;

@@ -1,0 +1,27 @@
+# One-click deploy of the ANP Chat relay (which also serves the frontend) to
+# Render (https://render.com) — a free web host you can set up entirely from a
+# browser, no local install needed. The resulting https URL serves BOTH the
+# chat frontend and the relay, so a phone just opens that one URL.
+#
+# How to use (from a phone or any browser):
+#   1. Fork this repo on GitHub.
+#   2. Go to https://dashboard.render.com → New → Blueprint → pick your fork.
+#   3. Render reads this file, builds, and deploys. Open the given
+#      https://<name>.onrender.com/ URL — that's your chat.
+#   (Free instances sleep when idle and take ~30s to wake on first hit.)
+services:
+  - type: web
+    name: anp-chat
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run serve
+    envVars:
+      # Render provides PORT and terminates TLS at its proxy, so trust the
+      # forwarded client IP for per-IP rate limiting.
+      - key: ANP_TRUST_PROXY
+        value: "1"
+      - key: NODE_VERSION
+        value: "22"
+    healthCheckPath: /health
+    autoDeploy: true

@@ -29,7 +29,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { JOIN_TTL, POW_BITS, verifyEvent } from "../shared/events.js";
 import { nowSeconds } from "../shared/crypto.js";
@@ -44,7 +44,10 @@ const POW_REQUIRED_BITS = Number(process.env.ANP_POW_BITS ?? POW_BITS);
  * Off by default (a direct-facing relay must NOT trust client-set headers).
  */
 const TRUST_PROXY = process.env.ANP_TRUST_PROXY === "1";
-const PUBLIC_DIR = new URL("../../public", import.meta.url).pathname;
+/** Frontend directory. Defaults to <cwd>/public so it resolves the same
+ * whether run via tsx (dev) or as a bundled JS file (prod), as long as the
+ * process starts from the repo root. Override with ANP_PUBLIC_DIR. */
+const PUBLIC_DIR = process.env.ANP_PUBLIC_DIR ?? resolve(process.cwd(), "public");
 
 /** Client IP for rate-limiting: forwarded header when trusted, else socket. */
 function clientIp(req: IncomingMessage): string {

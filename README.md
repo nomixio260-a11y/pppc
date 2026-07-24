@@ -13,7 +13,32 @@
        → 署名付きCRDTでメッセージ同期（DMは本文も暗号化）
 ```
 
-## 起動方法（クイックスタート）
+## 📱 スマホだけで使う（`npm` 不要・PC不要）
+
+スマホしかない・ローカルで `npm install` したくない場合は、**Webから一度デプロイして、あとはURLを開くだけ**にできます。フロントと Relay は同じプロセスなので、**1つのURLでチャットが完結**します。
+
+### 方法A: Render に1回デプロイ（常設・おすすめ）
+
+1. GitHub でこのリポジトリを **Fork**（スマホのブラウザ/GitHubアプリで可）。
+2. [Render](https://dashboard.render.com) にログイン → **New → Blueprint** → 自分のForkを選択。
+   リポジトリ同梱の `render.yaml` を読んで自動でビルド＆デプロイします（無料プランでOK）。
+3. できあがった **`https://<名前>.onrender.com/`** をスマホのブラウザで開く → 表示名を入れて完了。
+4. 同じURLを友達に送れば、その人もスマホで開くだけで同じチャンネルに入れます。
+
+> 無料プランはアクセスが無いとスリープし、初回だけ ~30秒 起動待ちがあります。Railway / Fly.io / Deno Deploy などでも `npm run build` → `node dist/relay.mjs`（`PORT` は各社が自動指定、`ANP_TRUST_PROXY=1` 推奨）で同様に動きます。
+
+### 方法B: GitHub Actions の一時デモ（デプロイ設定すら不要）
+
+GitHub の **Actions → "ANP Demo (Cloudflare Tunnel)" → Run workflow**（スマホのGitHubアプリ/ブラウザから実行可）を押すと、数分後にジョブサマリーに **`https://….trycloudflare.com`** が出ます。それをスマホで開けば即チャット。指定した分数で自動停止します。
+（「Run workflow」ボタンは、ワークフローがデフォルトブランチにある時だけ表示されます。無い場合は方法Aを使ってください。）
+
+### 方法C: 既にRelayがあるなら、リンクを開くだけ
+
+どこかにフロントを置いてあり Relay のURLが分かっているなら、**`https://フロント/#relay=wss://Relayのアドレス`** という形のリンクを開くだけで、そのRelayに自動接続します（スマホでの共有に便利）。
+
+---
+
+## 起動方法（PCでローカル実行する場合）
 
 **必要なもの**: Node.js 20 以上（推奨 22）。ブラウザは Chrome / Edge / Safari / Firefox の最新版。
 
@@ -102,8 +127,9 @@ Tunnel の背後では全クライアントが同一送信元IPに見えるた�
 
 | コマンド | 説明 |
 |---|---|
-| `npm run build` | 型チェック + フロントビルド（`public/anp.js`・単一ファイル`anp.html`・配布`dist/`） |
-| `npm run relay` | Relay サーバー起動（`PORT` / `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY`） |
+| `npm run build` | 型チェック + フロントビルド + 本番用Relay `dist/relay.mjs` + 配布`dist/` |
+| `npm run relay` | Relay 起動（開発・tsx）（`PORT`/`HOST`/`ANP_POW_BITS`/`ANP_TRUST_PROXY`/`ANP_PUBLIC_DIR`） |
+| `npm run serve` | 本番用Relay 起動（`node dist/relay.mjs`・devDependencies不要、ホスティング向け） |
 | `npm start` | build + relay |
 | `npm test` | ユニット + Relay 統合テスト（70件） |
 | `npm run test:e2e` | 実ブラウザE2E（チャンネル自動探索 + 暗号DM、要 Chromium） |
