@@ -17,7 +17,7 @@ const BASE = `http://localhost:${PORT}`;
 
 function spawnRelay() {
   const child = spawn(process.execPath, ["--import", "tsx", "src/relay/server.ts"], {
-    env: { ...process.env, PORT: String(PORT) },
+    env: { ...process.env, PORT: String(PORT), ANP_HTTPS: "0" },
     stdio: ["ignore", "pipe", "inherit"],
   });
   return new Promise((resolve, reject) => {

@@ -27,7 +27,9 @@
  * Also serves the browser client from ./public for a one-command demo.
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse, type Server as HttpServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { networkInterfaces } from "node:os";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
@@ -368,7 +370,7 @@ function restBucket(req: IncomingMessage): TokenBucket {
   return bucket;
 }
 
-const httpServer = createServer(async (req, res) => {
+async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<unknown> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   try {
     if (req.method === "OPTIONS") {
@@ -429,13 +431,11 @@ const httpServer = createServer(async (req, res) => {
   } catch (err) {
     json(res, 400, { error: (err as Error).message });
   }
-});
+}
 
 // ---------------------------------------------------------------------------
 // WebSocket protocol
 // ---------------------------------------------------------------------------
-
-const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_FRAME_BYTES });
 
 interface ConnState {
   alive: boolean;
@@ -448,7 +448,7 @@ const connections = new Map<WebSocket, ConnState>();
 /** active WebSocket connections per remote address */
 const connsPerIp = new Map<string, number>();
 
-wss.on("connection", (ws, req) => {
+function onWsConnection(ws: WebSocket, req: IncomingMessage): void {
   if (connections.size >= MAX_CONNECTIONS) {
     ws.close(1013, "server busy");
     return;
@@ -535,7 +535,13 @@ wss.on("connection", (ws, req) => {
     else connsPerIp.set(state.ip, n);
   });
   ws.on("error", () => ws.close());
-});
+}
+
+/** Attach a WebSocket server (sharing all relay state) to an HTTP(S) server. */
+function attachWs(server: HttpServer): void {
+  const wss = new WebSocketServer({ server, maxPayload: MAX_FRAME_BYTES });
+  wss.on("connection", onWsConnection);
+}
 
 // liveness: ping every connection; reap ones that never pong back
 setInterval(() => {
@@ -553,14 +559,77 @@ setInterval(() => {
   }
 }, PING_INTERVAL_MS).unref();
 
+/** First non-internal IPv4 address (the LAN IP phones on the same Wi-Fi use). */
+function lanIp(): string | undefined {
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const a of addrs ?? []) {
+      if (a.family === "IPv4" && !a.internal) return a.address;
+    }
+  }
+  return undefined;
+}
+
+const httpServer = createServer(handleHttp);
+attachWs(httpServer);
+
 httpServer.listen(PORT, HOST, () => {
-  const url = `http://localhost:${PORT}/`;
-  console.log(`\n  ✅ ANP Chat が起動しました → ${url}\n`);
-  console.log(`[anp-relay] listening http://${HOST}:${PORT}  (PoW ${POW_REQUIRED_BITS} bits, trust-proxy ${TRUST_PROXY})`);
-  // ANP_OPEN=1 (set by the double-click launchers) opens the browser for a
-  // zero-friction "download and run" experience. No-op on servers.
-  if (process.env.ANP_OPEN === "1") openBrowser(url);
+  const local = `http://localhost:${PORT}/`;
+  console.log(`\n  ✅ ANP Chat が起動しました → ${local}\n`);
+  console.log(`[anp-relay] listening http ${HOST}:${PORT}  (PoW ${POW_REQUIRED_BITS} bits, trust-proxy ${TRUST_PROXY})`);
+  if (process.env.ANP_OPEN === "1") openBrowser(local);
+
+  // LAN HTTPS: lets phones/other devices on the same Wi-Fi use it. Browsers
+  // block Web Crypto/WebRTC over plain http (except localhost), so we serve
+  // https with a self-signed cert. Off when behind a real proxy (hosted) or
+  // ANP_HTTPS=0. This uses NO external service — the cert is generated locally.
+  if (process.env.ANP_HTTPS === "0" || TRUST_PROXY) return;
+  const ip = lanIp();
+  if (!ip) return;
+  void startLanHttps(ip);
 });
+
+async function startLanHttps(ip: string): Promise<void> {
+  try {
+    // selfsigned's typings vary across versions; call through `any` and await
+    // in case it returns a promise (v5+). No external service — local cert.
+    const selfsigned = (await import("selfsigned")).default as unknown as {
+      generate: (attrs: unknown, opts: unknown) => { private: string; cert: string } | Promise<{ private: string; cert: string }>;
+    };
+    const httpsPort = PORT + 1;
+    const pems = await selfsigned.generate([{ name: "commonName", value: ip }], {
+      days: 3650,
+      keySize: 2048,
+      extensions: [
+        {
+          name: "subjectAltName",
+          altNames: [
+            { type: 7, ip }, // IP
+            { type: 7, ip: "127.0.0.1" },
+            { type: 2, value: "localhost" }, // DNS
+          ],
+        },
+      ],
+    });
+    const httpsServer = createHttpsServer({ key: pems.private, cert: pems.cert }, handleHttp);
+    attachWs(httpsServer);
+    httpsServer.on("error", () => {}); // e.g. port busy — ignore, http still works
+    httpsServer.listen(httpsPort, "0.0.0.0", async () => {
+      const lanUrl = `https://${ip}:${httpsPort}/`;
+      console.log(`[anp-relay] https ${ip}:${httpsPort}  (LAN / スマホ用・自己署名)\n`);
+      console.log(`  📱 同じWi-Fiのスマホから使うには、下のURLを開いてください（初回のみ証明書の警告を「続行/アクセスする」）:`);
+      console.log(`     ${lanUrl}\n`);
+      try {
+        const qrcode = (await import("qrcode-terminal")).default;
+        qrcode.generate(lanUrl, { small: true });
+        console.log(`  ↑ スマホのカメラでこのQRを読み取ってもOK\n`);
+      } catch {
+        /* qr optional */
+      }
+    });
+  } catch (err) {
+    console.log(`[anp-relay] LAN https を起動できませんでした: ${(err as Error).message}`);
+  }
+}
 
 async function openBrowser(url: string): Promise<void> {
   try {
