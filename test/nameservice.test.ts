@@ -90,6 +90,21 @@ test("an expired stored record never beats a fresh incoming one", async () => {
   assert.equal(store.resolve("n")?.value, "new");
 });
 
+test("merging an identical, already-stored record is not reported as a win", async () => {
+  // guards against the gossip-storm bug: callers re-broadcast merge() winners,
+  // so a converged record re-received via anti-entropy must return false or it
+  // would circulate the mesh forever
+  const { keys, networkId } = await setup();
+  const store = new NameServiceStore(networkId);
+  const record = await createNameRecord(networkId, keys, "service/chat", { nodes: ["a"] }, 1);
+  assert.equal(await store.merge(record), true, "first insert wins");
+  assert.equal(await store.merge(record), false, "identical re-receive is not a win");
+  // a structurally-equal but re-signed newer record (different signature) does win
+  const bumped = await createNameRecord(networkId, keys, "service/chat", { nodes: ["a"] }, 2);
+  assert.equal(await store.merge(bumped), true, "strictly newer version wins");
+  assert.equal(await store.merge(bumped), false, "and its own re-receive does not");
+});
+
 test("replicas converge regardless of merge order", async () => {
   const { keys, networkId } = await setup();
   const a = new NameServiceStore(networkId);

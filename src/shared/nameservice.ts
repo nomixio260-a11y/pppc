@@ -121,7 +121,15 @@ export class NameServiceStore {
     const current = this.records.get(record.name);
     // an expired stored record never beats a fresh incoming one — otherwise a
     // name whose publisher restarted at version 1 could stay dead forever
-    if (!current || isExpired(current, now) || pickNewer(record, current) === record) {
+    if (!current || isExpired(current, now)) {
+      this.records.set(record.name, record);
+      return true;
+    }
+    // A win is only reported when the stored record STRICTLY changed. Signatures
+    // cover the full record content, so an identical re-receive has the same
+    // signature and must NOT be reported as a win — otherwise callers that
+    // re-gossip winners would loop a converged record around the mesh forever.
+    if (pickNewer(record, current) === record && record.signature !== current.signature) {
       this.records.set(record.name, record);
       return true;
     }

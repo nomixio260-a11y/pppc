@@ -25,6 +25,8 @@ const IDLE_TIMEOUT_MS = 20_000;
 
 interface IncomingTransfer {
   cid: string;
+  /** the peer we requested this blob from; only it may advance the transfer */
+  peer: NodeId;
   chunks: (Uint8Array | undefined)[];
   received: number;
   total: number;
@@ -95,6 +97,7 @@ export class FileService {
     return new Promise<Uint8Array>((resolve, reject) => {
       const transfer: IncomingTransfer = {
         cid,
+        peer,
         chunks: [],
         received: 0,
         total: -1,
@@ -139,7 +142,7 @@ export class FileService {
       }
       case "BLOB_META": {
         const transfer = this.incoming.get(msg.cid);
-        if (!transfer) return true;
+        if (!transfer || transfer.peer !== from) return true; // only the serving peer
         this.touch(transfer);
         if (
           typeof msg.size !== "number" ||
@@ -160,7 +163,7 @@ export class FileService {
       }
       case "BLOB_CHUNK": {
         const transfer = this.incoming.get(msg.cid);
-        if (!transfer || transfer.total < 0) return true;
+        if (!transfer || transfer.peer !== from || transfer.total < 0) return true;
         if (typeof msg.idx !== "number" || msg.idx < 0 || msg.idx >= transfer.total) return true;
         if (transfer.chunks[msg.idx]) return true; // duplicate
         this.touch(transfer); // progress resets the idle deadline
@@ -186,7 +189,7 @@ export class FileService {
       }
       case "BLOB_ERR": {
         const transfer = this.incoming.get(msg.cid);
-        transfer?.reject(new Error(msg.reason || "peer error"));
+        if (transfer && transfer.peer === from) transfer.reject(new Error(msg.reason || "peer error"));
         return true;
       }
       default:

@@ -149,6 +149,9 @@ export class Mesh {
         this.dropLinkById(event.node_id, "peer left");
         this.peers.delete(event.node_id);
         this.clearRetry(event.node_id);
+        // clear backoff too, so a quick leave/rejoin reconnects immediately
+        // (matches removePeer/prune; otherwise stale backoff stalls it ~1min)
+        this.attempts.delete(event.node_id);
         this.cb.onPeerClose(event.node_id);
         break;
       }

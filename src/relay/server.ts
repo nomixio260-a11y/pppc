@@ -31,7 +31,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
-import { POW_BITS, verifyEvent } from "../shared/events.js";
+import { JOIN_TTL, POW_BITS, verifyEvent } from "../shared/events.js";
 import { nowSeconds } from "../shared/crypto.js";
 import type { AnpEvent, ClientFrame, EventFilter, RelayFrame } from "../shared/types.js";
 
@@ -45,7 +45,9 @@ const MAX_EVENTS_PER_NODE = 16;
 /** separate, higher cap for SIGNAL bursts (trickle ICE during mesh bootstrap) */
 const MAX_SIGNALS_PER_NODE = 256;
 const MAX_NETWORKS = 1000;
+const MAX_JOINS_PER_NETWORK = 2000;
 const MAX_CONNECTIONS = 500;
+const MAX_CONNECTIONS_PER_IP = 16;
 const MAX_FRAME_BYTES = 256 * 1024;
 const MAX_SUBS_PER_CONN = 8;
 const RATE_CAPACITY = 60; // token bucket: burst
@@ -106,8 +108,23 @@ class EventStore {
         nodes = new Map();
         this.joinIndex.set(event.network_id, nodes);
       }
+      // clamp retention to the intended JOIN lifetime — never trust a node's
+      // self-declared expires_at (could be up to the 24h event ceiling)
+      const expiry = Math.min(event.expires_at, nowSeconds() + JOIN_TTL);
       const prev = nodes.get(event.node_id) ?? 0;
-      nodes.set(event.node_id, Math.max(prev, event.expires_at));
+      nodes.set(event.node_id, Math.max(prev, expiry));
+      // bound the index: evict the soonest-expiring node when over capacity
+      if (nodes.size > MAX_JOINS_PER_NETWORK) {
+        let soonest: string | undefined;
+        let soonestAt = Infinity;
+        for (const [nodeId, at] of nodes) {
+          if (at < soonestAt) {
+            soonestAt = at;
+            soonest = nodeId;
+          }
+        }
+        if (soonest && soonest !== event.node_id) nodes.delete(soonest);
+      }
     }
     if (bucket.has(event.id)) return { added: false, reason: "duplicate" };
 
@@ -403,16 +420,27 @@ interface ConnState {
   alive: boolean;
   bucket: TokenBucket;
   subs: Set<Subscription>;
+  ip: string;
 }
 
 const connections = new Map<WebSocket, ConnState>();
+/** active WebSocket connections per remote address */
+const connsPerIp = new Map<string, number>();
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   if (connections.size >= MAX_CONNECTIONS) {
     ws.close(1013, "server busy");
     return;
   }
-  const state: ConnState = { alive: true, bucket: new TokenBucket(), subs: new Set() };
+  const ip = req.socket.remoteAddress ?? "unknown";
+  // per-IP cap: one source can't monopolize the global slots or multiply its
+  // rate/CPU budget by opening many connections
+  if ((connsPerIp.get(ip) ?? 0) >= MAX_CONNECTIONS_PER_IP) {
+    ws.close(1013, "too many connections from this address");
+    return;
+  }
+  connsPerIp.set(ip, (connsPerIp.get(ip) ?? 0) + 1);
+  const state: ConnState = { alive: true, bucket: new TokenBucket(), subs: new Set(), ip };
   connections.set(ws, state);
 
   ws.on("pong", () => {
@@ -481,6 +509,9 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     for (const sub of state.subs) subscriptions.delete(sub);
     connections.delete(ws);
+    const n = (connsPerIp.get(state.ip) ?? 1) - 1;
+    if (n <= 0) connsPerIp.delete(state.ip);
+    else connsPerIp.set(state.ip, n);
   });
   ws.on("error", () => ws.close());
 });
