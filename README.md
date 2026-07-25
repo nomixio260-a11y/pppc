@@ -78,8 +78,9 @@ ANP_PUBLIC_HOST=chat.example.com ANP_HTTPS_PORT=443 \
 | `start.bat` / `start.command` / `start.sh` | 上記＋ブラウザ自動起動（ダブルクリック用） |
 | `npm run build` | ソースから再ビルド（`server.mjs`・`public/anp.js`・単一`anp.html`・配布`dist/` を再生成、開発時のみ） |
 | `npm run dev` | 開発用（build → tsx でRelay起動） |
-| `npm test` | ユニット + Relay 統合テスト（70件、要 `npm install`） |
+| `npm test` | ユニット + Relay 統合テスト（80件、要 `npm install`） |
 | `npm run test:e2e` | 実ブラウザE2E（チャンネル自動探索 + 暗号DM、要 Chromium） |
+| `npm run test:e2e:multirelay` | Relay 2台での実ブラウザE2E（Relay多様性 §8.3 / Relay 1台停止での継続 §12.1） |
 
 環境変数: `PORT`（既定8787）/ `ANP_HTTPS_PORT`（既定 `PORT+1`）/ `ANP_PUBLIC_HOST`（公開IP/ドメイン）/ `ANP_TLS_CERT`・`ANP_TLS_KEY`（正規証明書の持ち込み）/ `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY`（プロキシ背後で1・その場合内蔵httpsは自動オフ）/ `ANP_OPEN`（1でブラウザ自動起動）/ `ANP_HTTPS`（0で内蔵https/QRを無効）/ `ANP_PUBLIC_DIR`。
 
@@ -104,7 +105,7 @@ src/client/    フロント
   store.ts        IndexedDB（IndexedDB不可環境はメモリfallback）
 public/        フロントUI（index.html / styles.css / ビルド生成物）
 dist/          配布用フロント一式（ビルドで生成）
-test/          ユニット70件 + 実ブラウザE2E
+test/          ユニット80件 + 実ブラウザE2E
 ```
 
 以下は基盤プロトコル ANP v2 の詳細（チャットUIはこの上に構築）。
@@ -143,7 +144,7 @@ test/          ユニット70件 + 実ブラウザE2E
 
 ### Identity（設計書 §4, §12）
 
-- `Network ID = SHA-256(Genesis Public Key)` — 同じ定義から常に同じ名前が得られる
+- `Network ID = SHA-256(Genesis Public Key ‖ ProtocolVersion ‖ FixedDomainTag)` — 同じ定義から常に同じ名前が得られる（Discovery仕様 §4.2）
 - `Node ID = SHA-256(Node Public Key)` — 秘密鍵は IndexedDB から出ない
 - 参加は招待証明書チェーンで証明。先頭は Genesis 鍵の署名、`invite` 権限を持つリンクだけが委譲でき、**各リンクの権限は発行者の権限の部分集合**（権限昇格不可）、長さは16まで
 - 招待は2段階: 参加者が鍵を生成して公開鍵（参加リクエストコード）を渡し、招待者が証明書チェーンを含む招待バンドル/リンクを返す
@@ -218,7 +219,7 @@ DataChannel を確立した SDP は宛先ノード鍵に暗号化されている
 
 ## 検証
 
-- `npm test`: 70件 — 暗号（ECIES・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、**オープンルーム（room束縛JOIN・招待網侵入不可・PoW必須）**、**DM（共有鍵の対称性・第三者は復号/参加不可）**、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/著者別失効/squat防止/再ゴシップ抑止）、信頼スコア、Relay統合（メンバーシップゲート/不正イベント耐性）
+- `npm test`: 80件 — 暗号（ECIES・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、**オープンルーム（room束縛JOIN・招待網侵入不可・PoW必須）**、**DM（共有鍵の対称性・第三者は復号/参加不可）**、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/著者別失効/squat防止/再ゴシップ抑止）、信頼スコア、Relay統合（メンバーシップゲート/不正イベント耐性）
 - `npm run test:e2e`: 実ブラウザ — **表示名だけで #general に自動参加→自動探索→WebRTC接続**、チャンネル双方向チャット、CID検証ファイル転送、**ECDH暗号DMの双方向同期**、共有リンクからのチャンネル参加。スマホ(390px)/PC 両ビューポートでスクリーンショット確認済み
-- 4ラウンドの敵対的監査（AIエージェントによる多次元レビュー＋反証検証）を実施し、各ラウンドの確認済み欠陥をすべて修正（クリティカル: Relayクラッシュ、失効un-revoke攻撃、NSゴシップ無限ストーム 等）
-- 4ラウンドの敵対的監査（AIエージェントによる多次元レビュー＋反証検証）を実施し、各ラウンドの確認済み欠陥をすべて修正（クリティカル: Relayクラッシュ、失効un-revoke攻撃、NSゴシップ無限ストーム 等）
+- `npm run test:e2e:multirelay`: 実ブラウザ・Relay2台 — 同一ノードが**2台のRelayから別々に観測される**こと（探索スコア §8.3 のRelay多様性項が実際に加点されること）を設定画面の「Relay多様性」表示で検証し、続けて**Relayを1台強制停止**してもチャットと新規ノードの探索が生き残ること（§12.1 フェイルオーバー）を確認
+- 4ラウンドの敵対的監査（AIエージェントによる多次元レビュー＋反証検証）を実施し、各ラウンドの確認済み欠陥をすべて修正（クリティカル: Relayクラッシュ、失効un-revoke攻撃、NSゴシップ無限ストーム、**Relay多様性項の死蔵**（重複イベントが id で握り潰され `relay_count` が常に1だった） 等）

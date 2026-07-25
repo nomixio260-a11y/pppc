@@ -32,6 +32,13 @@ export interface RelayClientOptions {
   urls: string[];
   filter: EventFilter;
   onEvent: (event: AnpEvent, relayUrl: string) => void;
+  /**
+   * Fires for EVERY delivery of an event, including duplicates from other
+   * relays. `onEvent` only fires once per event id (processing), so this is
+   * what makes "how many distinct relays reported this node" observable —
+   * the relay-diversity term of the discovery score (§8.3, §14.3).
+   */
+  onSighting?: (event: AnpEvent, relayUrl: string) => void;
   onStatus?: (relayUrl: string, connected: boolean) => void;
 }
 
@@ -52,7 +59,10 @@ interface RelayConn {
 
 export class RelayPool {
   private conns = new Map<string, RelayConn>();
-  private seen = new Set<string>();
+  /** event id -> the (node, type) it was verified as, so a duplicate can be
+   * attributed to a relay without re-verifying, and cannot be re-attributed
+   * to a different node by a lying relay. */
+  private seen = new Map<string, { node_id: string; type: string }>();
   private closed = false;
 
   constructor(private readonly opts: RelayClientOptions) {}
@@ -161,18 +171,27 @@ export class RelayPool {
         const event = frame.event;
         conn.stats.eventsReceived++;
         conn.stats.lastEventAt = nowSeconds();
-        if (this.seen.has(event.id)) return;
+        const known = this.seen.get(event.id);
+        if (known) {
+          // already processed: count the sighting (relay diversity) only when
+          // this relay reports the same node/type we verified it as
+          if (known.node_id === event.node_id && known.type === event.type) {
+            this.opts.onSighting?.(event, conn.url);
+          }
+          return;
+        }
         // Never trust the relay: re-verify every event locally (§14.1).
         // PoW is not re-checked here (powBits: 0) — invite chains gate
         // membership; the relay-side PoW gate is anti-spam for storage.
         const check = await verifyEvent(event, { powBits: 0 });
         if (!check.ok) return;
         if (this.seen.has(event.id)) return; // re-check after await
-        this.seen.add(event.id);
+        this.seen.set(event.id, { node_id: event.node_id, type: event.type });
         if (this.seen.size > MAX_SEEN_IDS) {
-          const ids = [...this.seen];
-          this.seen = new Set(ids.slice(ids.length / 2));
+          const ids = [...this.seen.keys()];
+          for (const id of ids.slice(0, ids.length / 2)) this.seen.delete(id);
         }
+        this.opts.onSighting?.(event, conn.url);
         this.opts.onEvent(event, conn.url);
       }
     };
@@ -190,7 +209,8 @@ export class RelayPool {
 
   /** Publish to every relay; queues for relays that are currently down. */
   publish(event: AnpEvent): void {
-    this.seen.add(event.id); // don't re-process our own events
+    // don't re-process our own events
+    this.seen.set(event.id, { node_id: event.node_id, type: event.type });
     for (const conn of this.conns.values()) {
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
         this.sendFrame(conn.ws, { frame: "EVENT", event });

@@ -219,6 +219,21 @@ export class Conversation {
       urls: this.spec.relays,
       filter: { network_id: this.networkId, target: this.id.myNodeId },
       onEvent: (event, relayUrl) => void this.handleRelayEvent(event, relayUrl),
+      // every delivery, including the same event from a second relay: this is
+      // how the relay-diversity term of the score gets real data (§8.3)
+      onSighting: (event, relayUrl) => {
+        if (event.node_id === this.id.myNodeId) return;
+        if (event.type !== "JOIN" && event.type !== "HEARTBEAT") return;
+        const relays = this.candidateRelays.get(event.node_id) ?? new Set<string>();
+        const before = relays.size;
+        relays.add(relayUrl);
+        this.candidateRelays.set(event.node_id, relays);
+        const candidate = this.candidates.get(event.node_id);
+        if (candidate && relays.size !== before) {
+          candidate.relay_count = relays.size;
+          this.applyPriority();
+        }
+      },
       onStatus: (_url, connected) => {
         this.deps.onChange(this);
         if (connected) void this.announce();

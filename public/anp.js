@@ -888,7 +888,10 @@ var RelayPool = class {
     this.opts = opts;
   }
   conns = /* @__PURE__ */ new Map();
-  seen = /* @__PURE__ */ new Set();
+  /** event id -> the (node, type) it was verified as, so a duplicate can be
+   * attributed to a relay without re-verifying, and cannot be re-attributed
+   * to a different node by a lying relay. */
+  seen = /* @__PURE__ */ new Map();
   closed = false;
   start() {
     for (const url of this.opts.urls) this.addRelay(url);
@@ -985,15 +988,22 @@ var RelayPool = class {
         const event = frame.event;
         conn.stats.eventsReceived++;
         conn.stats.lastEventAt = nowSeconds();
-        if (this.seen.has(event.id)) return;
+        const known = this.seen.get(event.id);
+        if (known) {
+          if (known.node_id === event.node_id && known.type === event.type) {
+            this.opts.onSighting?.(event, conn.url);
+          }
+          return;
+        }
         const check = await verifyEvent(event, { powBits: 0 });
         if (!check.ok) return;
         if (this.seen.has(event.id)) return;
-        this.seen.add(event.id);
+        this.seen.set(event.id, { node_id: event.node_id, type: event.type });
         if (this.seen.size > MAX_SEEN_IDS) {
-          const ids = [...this.seen];
-          this.seen = new Set(ids.slice(ids.length / 2));
+          const ids = [...this.seen.keys()];
+          for (const id of ids.slice(0, ids.length / 2)) this.seen.delete(id);
         }
+        this.opts.onSighting?.(event, conn.url);
         this.opts.onEvent(event, conn.url);
       }
     };
@@ -1010,7 +1020,7 @@ var RelayPool = class {
   }
   /** Publish to every relay; queues for relays that are currently down. */
   publish(event) {
-    this.seen.add(event.id);
+    this.seen.set(event.id, { node_id: event.node_id, type: event.type });
     for (const conn of this.conns.values()) {
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
         this.sendFrame(conn.ws, { frame: "EVENT", event });
@@ -1810,6 +1820,21 @@ var Conversation = class {
       urls: this.spec.relays,
       filter: { network_id: this.networkId, target: this.id.myNodeId },
       onEvent: (event, relayUrl) => void this.handleRelayEvent(event, relayUrl),
+      // every delivery, including the same event from a second relay: this is
+      // how the relay-diversity term of the score gets real data (§8.3)
+      onSighting: (event, relayUrl) => {
+        if (event.node_id === this.id.myNodeId) return;
+        if (event.type !== "JOIN" && event.type !== "HEARTBEAT") return;
+        const relays2 = this.candidateRelays.get(event.node_id) ?? /* @__PURE__ */ new Set();
+        const before = relays2.size;
+        relays2.add(relayUrl);
+        this.candidateRelays.set(event.node_id, relays2);
+        const candidate = this.candidates.get(event.node_id);
+        if (candidate && relays2.size !== before) {
+          candidate.relay_count = relays2.size;
+          this.applyPriority();
+        }
+      },
       onStatus: (_url, connected) => {
         this.deps.onChange(this);
         if (connected) void this.announce();
@@ -2527,9 +2552,10 @@ function renderDiscovery() {
   $("disc-count").textContent = String(ranked.length);
   $("disc-links").textContent = String(conv.connectedCount());
   $("disc-independent").textContent = conv.relayIndependent() ? "\u4F4E\uFF08\u30E1\u30C3\u30B7\u30E5\u81EA\u7ACB\uFF09" : "\u9AD8\uFF08\u63A2\u7D22\u4E2D\uFF09";
+  $("disc-diversity").textContent = String(ranked.reduce((m, c) => Math.max(m, c.relay_count), 0));
   $("disc-list").innerHTML = ranked.slice(0, 10).map(
     (c, i) => `<li><span class="muted">${i + 1}.</span> <code>${escapeHtml(c.node_id.slice(0, 8))}</code>
-           <span class="muted small">score ${c.score.toFixed(1)}${c.via_peer_table ? " \xB7 peer-table" : ""}${c.latency_ms !== void 0 ? ` \xB7 ${Math.round(c.latency_ms)}ms` : ""}</span></li>`
+           <span class="muted small">score ${c.score.toFixed(1)} \xB7 relay\xD7${c.relay_count}${c.via_peer_table ? " \xB7 peer-table" : ""}${c.latency_ms !== void 0 ? ` \xB7 ${Math.round(c.latency_ms)}ms` : ""}</span></li>`
   ).join("") || `<li class="muted">\u5019\u88DC\u306A\u3057</li>`;
 }
 function renderRelays() {

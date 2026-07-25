@@ -11,7 +11,8 @@
     "start": "node server.mjs",
     "dev": "npm run build && npm run relay",
     "test": "node --import tsx --test test/*.test.ts",
-    "test:e2e": "node test/e2e.browser.mjs"
+    "test:e2e": "node test/e2e.browser.mjs",
+    "test:e2e:multirelay": "node test/e2e.multirelay.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
