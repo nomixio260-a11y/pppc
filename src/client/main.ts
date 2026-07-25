@@ -341,6 +341,28 @@ async function downloadFile(conv: Conversation, meta: FileMeta): Promise<void> {
   }
 }
 
+/** Discovery panel: the scored candidate list the connection logic uses
+ * (discovery spec §8), so the layer is inspectable rather than a black box. */
+function renderDiscovery(): void {
+  const conv = activeId ? conversations.get(activeId) : undefined;
+  if (!conv) return;
+  const ranked = conv.rankedCandidates();
+  $("disc-count").textContent = String(ranked.length);
+  $("disc-links").textContent = String(conv.connectedCount());
+  $("disc-independent").textContent = conv.relayIndependent() ? "低（メッシュ自立）" : "高（探索中）";
+  $("disc-list").innerHTML =
+    ranked
+      .slice(0, 10)
+      .map(
+        (c, i) =>
+          `<li><span class="muted">${i + 1}.</span> <code>${escapeHtml(c.node_id.slice(0, 8))}</code>
+           <span class="muted small">score ${c.score.toFixed(1)}${c.via_peer_table ? " · peer-table" : ""}${
+             c.latency_ms !== undefined ? ` · ${Math.round(c.latency_ms)}ms` : ""
+           }</span></li>`,
+      )
+      .join("") || `<li class="muted">候補なし</li>`;
+}
+
 function renderRelays(): void {
   const list = $("relay-list");
   list.innerHTML =
@@ -470,6 +492,7 @@ function openDrawer(open: boolean): void {
   if (open) {
     renderMembers();
     renderRelays();
+    renderDiscovery();
   }
 }
 

@@ -9,6 +9,7 @@ import {
   rankCandidates,
   scoreCandidate,
   selectCandidate,
+  selectConnectTargets,
   type Candidate,
 } from "../src/shared/discovery.js";
 import { HEARTBEAT_TTL, JOIN_TTL } from "../src/shared/events.js";
@@ -88,4 +89,36 @@ test("viability: expired relay sightings drop out, peer-table intros stay", () =
 
 test("selectCandidate returns undefined with no candidates", () => {
   assert.equal(selectCandidate([], NOW), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Bounded-degree connect selection (§8.3 Step 5 + §12.2)
+// ---------------------------------------------------------------------------
+
+test("connect targets respect the link cap and take the best first", () => {
+  const ranked = ["a", "b", "c", "d"].map((n) => ({ node_id: n.repeat(64) }));
+  // no links yet, cap 2 -> the two best
+  const first = selectConnectTargets(ranked, { active: new Set(), maxLinks: 2 });
+  assert.deepEqual(first, [ranked[0]!.node_id, ranked[1]!.node_id]);
+
+  // one slot already used -> only the next best is chosen, no duplicates
+  const second = selectConnectTargets(ranked, { active: new Set([ranked[0]!.node_id]), maxLinks: 2 });
+  assert.deepEqual(second, [ranked[1]!.node_id]);
+
+  // at capacity -> nothing new
+  assert.deepEqual(
+    selectConnectTargets(ranked, { active: new Set([ranked[0]!.node_id, ranked[1]!.node_id]), maxLinks: 2 }),
+    [],
+  );
+});
+
+test("a freed slot promotes the next-best candidate (§12.2)", () => {
+  const ranked = ["a", "b", "c"].map((n) => ({ node_id: n.repeat(64) }));
+  // b failed and is skipped; the freed slot goes to c, not back to b
+  const targets = selectConnectTargets(ranked, {
+    active: new Set([ranked[0]!.node_id]),
+    maxLinks: 2,
+    skip: (id) => id === ranked[1]!.node_id,
+  });
+  assert.deepEqual(targets, [ranked[2]!.node_id]);
 });

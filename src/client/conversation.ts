@@ -348,6 +348,13 @@ export class Conversation {
       capabilities: existing?.capabilities,
     };
     this.candidates.set(event.node_id, candidate);
+    this.applyPriority();
+  }
+
+  /** Push the scored order into the mesh so connections are attempted
+   * best-first and freed slots go to the next-best candidate (§8.3, §12.2). */
+  private applyPriority(): void {
+    this.mesh?.setPriority(this.rankedCandidates().map((c) => c.node_id));
   }
 
   private sharesInviteRoot(chain: InviteCertificate[]): boolean {
@@ -450,6 +457,7 @@ export class Conversation {
           }
         }
         if (learned) {
+          this.applyPriority();
           this.deps.log(`peer table from ${from.slice(0, 8)}: ${learned} new peer(s) (chained discovery)`);
           await this.persistPeerTable();
           this.deps.onChange(this);
@@ -633,7 +641,10 @@ export class Conversation {
         via_peer_table: true,
       });
     }
-    if (rows.length) this.deps.log(`restored ${rows.length} cached peer(s) for ${this.title}`);
+    if (rows.length) {
+      this.applyPriority();
+      this.deps.log(`restored ${rows.length} cached peer(s) for ${this.title}`);
+    }
   }
 
   /** Merge signed Name Service records (§11.3) from a MANIFEST or a peer. */

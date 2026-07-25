@@ -131,6 +131,14 @@
           <div class="row gap"><input id="d-my-id" readonly /><button id="btn-copy-id2" class="btn small">コピー</button></div>
         </label>
       </section>
+      <details class="d-sec" id="discovery-sec">
+        <summary>探索状況</summary>
+        <div class="kv"><span>候補</span><span id="disc-count">0</span></div>
+        <div class="kv"><span>直結</span><span id="disc-links">0</span></div>
+        <div class="kv"><span>Relay依存</span><span id="disc-independent">—</span></div>
+        <ul id="disc-list" class="plain"></ul>
+      </details>
+
       <details class="d-sec">
         <summary>Relay</summary>
         <p class="muted small">オープンチャンネル/DMの相手探索に使うサーバー。全会話で共有。</p>

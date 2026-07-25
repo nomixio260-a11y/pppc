@@ -38,6 +38,7 @@ import type {
   SignalEvent,
 } from "../shared/types.js";
 import { nowSeconds, randomHex } from "../shared/crypto.js";
+import { selectConnectTargets } from "../shared/discovery.js";
 
 export type DcMessage =
   | { t: "HELLO"; node_id: NodeId; pubkey: string; nickname?: string; chain: InviteCertificate[]; peers: PeerInfo[] }
@@ -98,6 +99,12 @@ const RETRY_MAX_MS = 60_000;
 /** upper bound on a single DataChannel frame; a base64 16 KiB blob chunk plus
  * envelope fits well under this, so it only rejects abusive oversized frames */
 const MAX_DC_FRAME_BYTES = 512 * 1024;
+/** Bounded mesh degree: links we actively open. Gossip covers the rest, so a
+ * large channel stays connected without N² peer connections. */
+const MAX_ACTIVE_LINKS = 8;
+/** Hard ceiling including links others opened to us (we accept beyond the
+ * outbound cap so the graph stays connected, but not without limit). */
+const MAX_TOTAL_LINKS = 16;
 
 export class Mesh {
   /** peers known from discovery (valid JOIN seen) */
@@ -105,6 +112,8 @@ export class Mesh {
   private links = new Map<NodeId, Link>();
   /** per-peer reconnect backoff */
   private attempts = new Map<NodeId, { count: number; nextAt: number }>();
+  /** connection order from the discovery scorer, best-first (§8.3) */
+  private priority: NodeId[] = [];
   private retryTimers = new Map<NodeId, ReturnType<typeof setTimeout>>();
   private stopped = false;
 
@@ -165,12 +174,45 @@ export class Mesh {
     }
   }
 
+  /**
+   * Connection order from the discovery scorer (§8.3 Step 5). Setting it also
+   * fills any free link slots with the best remaining candidates, which is how
+   * §12.2 "次点の候補へ進む" happens after a failure.
+   */
+  setPriority(ordered: NodeId[]): void {
+    this.priority = ordered;
+    this.fillSlots();
+  }
+
+  /** Open links to the best candidates until the degree cap is reached. */
+  private fillSlots(): void {
+    if (this.stopped) return;
+    const targets = selectConnectTargets(
+      this.priority.map((node_id) => ({ node_id })),
+      {
+        active: new Set(this.links.keys()),
+        maxLinks: MAX_ACTIVE_LINKS,
+        // responders wait for the other side; peers still backing off are skipped
+        skip: (id) => {
+          if (this.myNodeId >= id) return true;
+          if (!this.peers.has(id)) return true;
+          const attempt = this.attempts.get(id);
+          return !!attempt && Date.now() < attempt.nextAt;
+        },
+      },
+    );
+    for (const nodeId of targets) void this.initiate(nodeId);
+  }
+
   /** Initiate to peers we should connect to (smaller node_id initiates). */
   private maybeConnect(nodeId: NodeId): void {
     if (this.stopped || this.links.has(nodeId)) return;
     if (this.myNodeId >= nodeId) return; // the smaller id initiates; we wait
     const attempt = this.attempts.get(nodeId);
     if (attempt && Date.now() < attempt.nextAt) return; // still backing off
+    // bounded degree: a big channel must not become N² connections. Peers we
+    // can't link to directly still receive messages via gossip.
+    if (this.links.size >= MAX_ACTIVE_LINKS) return;
     void this.initiate(nodeId);
   }
 
@@ -330,6 +372,12 @@ export class Mesh {
           this.dropLink(from, existing, "superseded by newer offer session");
         }
       }
+      // accept inbound links past the outbound cap (keeps the graph connected)
+      // but not without limit
+      if (this.links.size >= MAX_TOTAL_LINKS) {
+        this.cb.log(`link cap reached; ignoring offer from ${short(from)}`);
+        return;
+      }
       const link = this.newLink(from, session, false, peer.pubkey, event.created_at);
       if (!link.rxSeen.has(seq)) link.rxSeen.add(seq);
       link.pc.ondatachannel = (ev) => this.wireDc(from, link, ev.channel);
@@ -467,6 +515,8 @@ export class Mesh {
       /* already closed */
     }
     this.cb.log(`link ${short(nodeId)} dropped (${reason})`);
+    // §12.2: a freed slot goes to the next-best candidate
+    setTimeout(() => this.fillSlots(), 0);
   }
 
   private dropLinkById(nodeId: NodeId, reason: string): void {

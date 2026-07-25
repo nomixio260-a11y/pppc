@@ -751,6 +751,18 @@ function isViable(c, now) {
   if (c.via_peer_table && now - c.join_at <= JOIN_TTL) return true;
   return decay(c.join_at, now, JOIN_TTL) > 0 || decay(c.heartbeat_at, now, HEARTBEAT_TTL) > 0;
 }
+function selectConnectTargets(ranked, opts) {
+  const free = opts.maxLinks - opts.active.size;
+  if (free <= 0) return [];
+  const out = [];
+  for (const c of ranked) {
+    if (out.length >= free) break;
+    if (opts.active.has(c.node_id)) continue;
+    if (opts.skip?.(c.node_id)) continue;
+    out.push(c.node_id);
+  }
+  return out;
+}
 
 // src/shared/nameservice.ts
 var REVOKED_PREFIX = "revoked/";
@@ -1026,6 +1038,8 @@ var PONG_DEADLINE_MS = 5e4;
 var RETRY_BASE_MS = 4e3;
 var RETRY_MAX_MS = 6e4;
 var MAX_DC_FRAME_BYTES = 512 * 1024;
+var MAX_ACTIVE_LINKS = 8;
+var MAX_TOTAL_LINKS = 16;
 var Mesh = class {
   constructor(networkId, keys, ecdhKey, myNodeId, cb) {
     this.networkId = networkId;
@@ -1039,6 +1053,8 @@ var Mesh = class {
   links = /* @__PURE__ */ new Map();
   /** per-peer reconnect backoff */
   attempts = /* @__PURE__ */ new Map();
+  /** connection order from the discovery scorer, best-first (§8.3) */
+  priority = [];
   retryTimers = /* @__PURE__ */ new Map();
   stopped = false;
   /** Called for every verified discovery event from the relay pool. */
@@ -1084,12 +1100,41 @@ var Mesh = class {
         break;
     }
   }
+  /**
+   * Connection order from the discovery scorer (§8.3 Step 5). Setting it also
+   * fills any free link slots with the best remaining candidates, which is how
+   * §12.2 "次点の候補へ進む" happens after a failure.
+   */
+  setPriority(ordered) {
+    this.priority = ordered;
+    this.fillSlots();
+  }
+  /** Open links to the best candidates until the degree cap is reached. */
+  fillSlots() {
+    if (this.stopped) return;
+    const targets = selectConnectTargets(
+      this.priority.map((node_id) => ({ node_id })),
+      {
+        active: new Set(this.links.keys()),
+        maxLinks: MAX_ACTIVE_LINKS,
+        // responders wait for the other side; peers still backing off are skipped
+        skip: (id) => {
+          if (this.myNodeId >= id) return true;
+          if (!this.peers.has(id)) return true;
+          const attempt = this.attempts.get(id);
+          return !!attempt && Date.now() < attempt.nextAt;
+        }
+      }
+    );
+    for (const nodeId of targets) void this.initiate(nodeId);
+  }
   /** Initiate to peers we should connect to (smaller node_id initiates). */
   maybeConnect(nodeId) {
     if (this.stopped || this.links.has(nodeId)) return;
     if (this.myNodeId >= nodeId) return;
     const attempt = this.attempts.get(nodeId);
     if (attempt && Date.now() < attempt.nextAt) return;
+    if (this.links.size >= MAX_ACTIVE_LINKS) return;
     void this.initiate(nodeId);
   }
   recordFailure(nodeId) {
@@ -1218,6 +1263,10 @@ var Mesh = class {
           this.dropLink(from, existing, "superseded by newer offer session");
         }
       }
+      if (this.links.size >= MAX_TOTAL_LINKS) {
+        this.cb.log(`link cap reached; ignoring offer from ${short(from)}`);
+        return;
+      }
       const link2 = this.newLink(from, session, false, peer.pubkey, event.created_at);
       if (!link2.rxSeen.has(seq)) link2.rxSeen.add(seq);
       link2.pc.ondatachannel = (ev) => this.wireDc(from, link2, ev.channel);
@@ -1345,6 +1394,7 @@ var Mesh = class {
     } catch {
     }
     this.cb.log(`link ${short(nodeId)} dropped (${reason})`);
+    setTimeout(() => this.fillSlots(), 0);
   }
   dropLinkById(nodeId, reason) {
     const link = this.links.get(nodeId);
@@ -1870,6 +1920,12 @@ var Conversation = class {
       capabilities: existing?.capabilities
     };
     this.candidates.set(event.node_id, candidate);
+    this.applyPriority();
+  }
+  /** Push the scored order into the mesh so connections are attempted
+   * best-first and freed slots go to the next-best candidate (§8.3, §12.2). */
+  applyPriority() {
+    this.mesh?.setPriority(this.rankedCandidates().map((c) => c.node_id));
   }
   sharesInviteRoot(chain) {
     const ourRoot = this.spec.inviteChain?.[0]?.issuer_pubkey;
@@ -1962,6 +2018,7 @@ var Conversation = class {
           }
         }
         if (learned) {
+          this.applyPriority();
           this.deps.log(`peer table from ${from.slice(0, 8)}: ${learned} new peer(s) (chained discovery)`);
           await this.persistPeerTable();
           this.deps.onChange(this);
@@ -2128,7 +2185,10 @@ var Conversation = class {
         via_peer_table: true
       });
     }
-    if (rows.length) this.deps.log(`restored ${rows.length} cached peer(s) for ${this.title}`);
+    if (rows.length) {
+      this.applyPriority();
+      this.deps.log(`restored ${rows.length} cached peer(s) for ${this.title}`);
+    }
   }
   /** Merge signed Name Service records (§11.3) from a MANIFEST or a peer. */
   async mergeManifest(records) {
@@ -2460,6 +2520,18 @@ async function downloadFile(conv, meta) {
     void renderChat();
   }
 }
+function renderDiscovery() {
+  const conv = activeId ? conversations.get(activeId) : void 0;
+  if (!conv) return;
+  const ranked = conv.rankedCandidates();
+  $("disc-count").textContent = String(ranked.length);
+  $("disc-links").textContent = String(conv.connectedCount());
+  $("disc-independent").textContent = conv.relayIndependent() ? "\u4F4E\uFF08\u30E1\u30C3\u30B7\u30E5\u81EA\u7ACB\uFF09" : "\u9AD8\uFF08\u63A2\u7D22\u4E2D\uFF09";
+  $("disc-list").innerHTML = ranked.slice(0, 10).map(
+    (c, i) => `<li><span class="muted">${i + 1}.</span> <code>${escapeHtml(c.node_id.slice(0, 8))}</code>
+           <span class="muted small">score ${c.score.toFixed(1)}${c.via_peer_table ? " \xB7 peer-table" : ""}${c.latency_ms !== void 0 ? ` \xB7 ${Math.round(c.latency_ms)}ms` : ""}</span></li>`
+  ).join("") || `<li class="muted">\u5019\u88DC\u306A\u3057</li>`;
+}
 function renderRelays() {
   const list = $("relay-list");
   list.innerHTML = relays.map(
@@ -2561,6 +2633,7 @@ function openDrawer(open) {
   if (open) {
     renderMembers();
     renderRelays();
+    renderDiscovery();
   }
 }
 function busy(btn, fn) {

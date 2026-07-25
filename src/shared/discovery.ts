@@ -105,3 +105,28 @@ export function isViable(c: Candidate, now: number): boolean {
   if (c.via_peer_table && now - c.join_at <= JOIN_TTL) return true;
   return decay(c.join_at, now, JOIN_TTL) > 0 || decay(c.heartbeat_at, now, HEARTBEAT_TTL) > 0;
 }
+
+/**
+ * Which peers to open links to next, best-first (§8.3 Step 5 + §12.2).
+ *
+ * The mesh keeps a bounded degree: a channel with 50 people must not become
+ * 50² connections. We hold at most `maxLinks` links, filled from the ranked
+ * candidate list; when one fails or drops, the next-best candidate takes the
+ * free slot ("次点の候補へ進む"). Messages still reach everyone because CRDT
+ * deltas are gossiped across the partial mesh.
+ */
+export function selectConnectTargets(
+  ranked: Array<{ node_id: NodeId }>,
+  opts: { active: Set<NodeId>; maxLinks: number; skip?: (id: NodeId) => boolean },
+): NodeId[] {
+  const free = opts.maxLinks - opts.active.size;
+  if (free <= 0) return [];
+  const out: NodeId[] = [];
+  for (const c of ranked) {
+    if (out.length >= free) break;
+    if (opts.active.has(c.node_id)) continue;
+    if (opts.skip?.(c.node_id)) continue;
+    out.push(c.node_id);
+  }
+  return out;
+}
