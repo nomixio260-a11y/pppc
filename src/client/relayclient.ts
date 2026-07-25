@@ -115,6 +115,12 @@ export class RelayPool {
     return n;
   }
 
+  /** URLs of relays that are up right now — what we advertise to peers so a
+   * relay-isolated node can learn a working one (§12.1). */
+  connectedUrls(): string[] {
+    return [...this.conns.values()].filter((c) => c.stats.connected).map((c) => c.url);
+  }
+
   statsSnapshot(): RelayStats[] {
     return [...this.conns.values()].map((c) => ({ ...c.stats }));
   }

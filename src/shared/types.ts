@@ -267,6 +267,9 @@ export interface PeerTableEntry {
   capabilities: Capability[];
   latency_hint?: number;
   nickname?: string;
+  /** relay URLs this node is using, so a peer whose own relays all died can
+   * learn a live one over the mesh (§12.1 relay failover) */
+  relays?: string[];
 }
 
 // ---------------------------------------------------------------------------

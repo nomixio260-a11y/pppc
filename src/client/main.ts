@@ -141,6 +141,7 @@ function deps() {
     onActivity: (c: Conversation) => {
       if (c.networkId !== activeId) renderConvList();
     },
+    onRelayAdopted: (url: string) => void adoptRelay(url),
     log,
   };
 }
@@ -391,6 +392,20 @@ async function addRelay(url: string): Promise<void> {
   await rejoinAll();
   toast("Relayを追加しました。再接続します", "ok");
 }
+/**
+ * A conversation learned a live relay from a peer while all of ours were down
+ * (§12.1). Persist it and hand it to the other conversations too — without a
+ * full rejoin, which would tear down the very links that rescued us.
+ */
+async function adoptRelay(url: string): Promise<void> {
+  if (relays.includes(url)) return;
+  relays = [...relays, url];
+  await store.put("kv", "relays", relays);
+  for (const c of conversations.values()) c.addRelayLive(url);
+  renderRelays();
+  toast(`ピアから生きているRelayを学習しました: ${url}`, "ok");
+}
+
 async function removeRelay(url: string): Promise<void> {
   relays = relays.filter((r) => r !== url);
   await store.put("kv", "relays", relays);

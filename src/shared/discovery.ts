@@ -130,3 +130,67 @@ export function selectConnectTargets(
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Relay hints (§12.1 relay failover)
+// ---------------------------------------------------------------------------
+
+/** How many relay URLs a node advertises in its peer-table row. */
+export const MAX_ADVERTISED_RELAYS = 4;
+/** Hard ceiling on a node's relay list, hints included. */
+export const MAX_TOTAL_RELAYS = 8;
+
+/**
+ * Normalize a relay URL for comparison and storage, or return undefined when
+ * it isn't a relay URL we'd ever dial. Only ws/wss, no credentials, no
+ * fragment, and a trailing slash is insignificant — so a peer can't get the
+ * same relay adopted twice under two spellings.
+ */
+export function normalizeRelayUrl(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || raw.length > 200) return undefined;
+  let u: URL;
+  try {
+    u = new URL(raw.trim());
+  } catch {
+    return undefined;
+  }
+  if (u.protocol !== "ws:" && u.protocol !== "wss:") return undefined;
+  if (u.username || u.password) return undefined;
+  if (!u.hostname) return undefined;
+  u.hash = "";
+  const path = u.pathname === "/" ? "" : u.pathname.replace(/\/$/, "");
+  return `${u.protocol}//${u.host}${path}${u.search}`;
+}
+
+/**
+ * Pick relay URLs advertised by peers that are worth adopting (§12.1).
+ *
+ * Adoption is deliberately conservative, because a URL from a peer is
+ * attacker-controlled input:
+ *  - it is purely ADDITIVE — the node's own relays are never replaced, so a
+ *    hostile hint cannot eclipse anyone (and every event is verified locally,
+ *    so a relay can withhold but never forge)
+ *  - a hint counts only when at least `quorum` DISTINCT peers advertise it,
+ *    so one lying peer cannot steer us
+ *  - the total relay count stays bounded
+ *
+ * `hints` maps a normalized URL to the set of node ids that advertised it.
+ * The result is deterministic: most-advertised first, ties by URL.
+ */
+export function selectRelayHints(
+  hints: Map<string, Set<NodeId>>,
+  opts: { known: Iterable<string>; quorum: number; max?: number },
+): string[] {
+  const known = new Set<string>();
+  for (const url of opts.known) {
+    const n = normalizeRelayUrl(url);
+    if (n) known.add(n);
+  }
+  const room = (opts.max ?? MAX_TOTAL_RELAYS) - known.size;
+  if (room <= 0) return [];
+  return [...hints.entries()]
+    .filter(([url, peers]) => peers.size >= opts.quorum && !known.has(url))
+    .sort((a, b) => b[1].size - a[1].size || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .slice(0, room)
+    .map(([url]) => url);
+}

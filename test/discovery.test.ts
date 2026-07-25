@@ -10,6 +10,8 @@ import {
   scoreCandidate,
   selectCandidate,
   selectConnectTargets,
+  normalizeRelayUrl,
+  selectRelayHints,
   type Candidate,
 } from "../src/shared/discovery.js";
 import { HEARTBEAT_TTL, JOIN_TTL } from "../src/shared/events.js";
@@ -121,4 +123,67 @@ test("a freed slot promotes the next-best candidate (§12.2)", () => {
     skip: (id) => id === ranked[1]!.node_id,
   });
   assert.deepEqual(targets, [ranked[2]!.node_id]);
+});
+
+// ---------------------------------------------------------------------------
+// Relay hints learned from peers (§12.1 relay failover)
+// ---------------------------------------------------------------------------
+
+test("relay URLs from peers are normalized, and non-relay URLs rejected", () => {
+  assert.equal(normalizeRelayUrl("ws://relay.example:8787/"), "ws://relay.example:8787");
+  assert.equal(normalizeRelayUrl("  wss://relay.example/anp/  "), "wss://relay.example/anp");
+  // the same relay under two spellings must collapse to one entry
+  assert.equal(normalizeRelayUrl("wss://relay.example/#x"), normalizeRelayUrl("wss://relay.example"));
+  // anything that isn't a plain ws/wss relay is refused
+  for (const bad of [
+    "http://relay.example",
+    "javascript:alert(1)",
+    "wss://user:pw@relay.example", // credentials in a peer-supplied URL
+    "file:///etc/passwd",
+    "not a url",
+    123,
+    null,
+    "wss://relay.example/" + "a".repeat(300),
+  ]) {
+    assert.equal(normalizeRelayUrl(bad), undefined, `should reject ${String(bad).slice(0, 30)}`);
+  }
+});
+
+test("relay hints need a quorum, skip known relays and stay bounded", () => {
+  const p = (n: string) => n.repeat(64);
+  const hints = new Map([
+    ["wss://one.example", new Set([p("a"), p("b")])], // 2 peers
+    ["wss://two.example", new Set([p("a")])], // 1 peer
+    ["wss://known.example", new Set([p("a"), p("b"), p("c")])], // already ours
+  ]);
+
+  // quorum 2: the single-peer hint is ignored, our own relay is not re-added
+  assert.deepEqual(selectRelayHints(hints, { known: ["wss://known.example/"], quorum: 2 }), [
+    "wss://one.example",
+  ]);
+
+  // quorum 1: both unknown hints, most-advertised first (deterministic)
+  assert.deepEqual(selectRelayHints(hints, { known: ["wss://known.example"], quorum: 1 }), [
+    "wss://one.example",
+    "wss://two.example",
+  ]);
+
+  // the total relay count is capped, so a peer can't flood our relay list
+  assert.deepEqual(selectRelayHints(hints, { known: ["wss://known.example"], quorum: 1, max: 2 }), [
+    "wss://one.example",
+  ]);
+  assert.deepEqual(selectRelayHints(hints, { known: ["wss://known.example"], quorum: 1, max: 1 }), []);
+});
+
+test("hint ties break deterministically by URL, not by insertion order", () => {
+  const p = (n: string) => n.repeat(64);
+  const peers = () => new Set([p("a"), p("b")]);
+  const forward = new Map([
+    ["wss://b.example", peers()],
+    ["wss://a.example", peers()],
+  ]);
+  const reverse = new Map([...forward.entries()].reverse());
+  const opts = { known: [] as string[], quorum: 2 };
+  assert.deepEqual(selectRelayHints(forward, opts), ["wss://a.example", "wss://b.example"]);
+  assert.deepEqual(selectRelayHints(reverse, opts), selectRelayHints(forward, opts));
 });

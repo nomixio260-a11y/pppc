@@ -25,7 +25,14 @@ import {
 } from "../shared/events.js";
 import { GSetLog, replicaNodeId, signLogEntry, verifyLogEntry, type LogEntry, type VersionVector } from "../shared/crdt.js";
 import { nodeIdFromPubkey, verifyInviteChain } from "../shared/identity.js";
-import { isViable, rankCandidates, type Candidate } from "../shared/discovery.js";
+import {
+  MAX_ADVERTISED_RELAYS,
+  isViable,
+  normalizeRelayUrl,
+  rankCandidates,
+  selectRelayHints,
+  type Candidate,
+} from "../shared/discovery.js";
 import { NameServiceStore, createNameRecord } from "../shared/nameservice.js";
 import { createManifest } from "../shared/events.js";
 import type {
@@ -76,6 +83,9 @@ export interface ConvDeps {
   onChange: (conv: Conversation) => void;
   /** new inbound message on a (possibly inactive) conversation */
   onActivity: (conv: Conversation) => void;
+  /** a relay URL was learned from peers while we had none working (§12.1);
+   * the app persists it and shares it with the other conversations */
+  onRelayAdopted?: (url: string) => void;
   log: (line: string) => void;
 }
 
@@ -100,6 +110,12 @@ export interface MemberView {
 }
 
 const ANTI_ENTROPY_MS = 60_000;
+/** How often established links re-exchange peer tables (§10.3). */
+const PEER_TABLE_INTERVAL_MS = 45_000;
+/** How often a relay-isolated node re-asks the mesh for relay URLs (§12.1). */
+const RELAY_ISOLATION_CHECK_MS = 5_000;
+/** A peer table reply is sent at most this often per peer (anti ping-pong). */
+const PEER_TABLE_REPLY_MIN_MS = 10_000;
 const MAX_ENTRIES_PER_DELTA = 512;
 /** What this browser node offers the network (discovery spec §10.1). */
 const MY_CAPABILITIES: Capability[] = ["chat", "store", "nameservice"];
@@ -128,6 +144,10 @@ export class Conversation {
   private candidates = new Map<NodeId, Candidate>();
   /** which relays reported each candidate — feeds the diversity score */
   private candidateRelays = new Map<NodeId, Set<string>>();
+  /** relay URLs advertised by peers -> who advertised them (§12.1 failover) */
+  private relayHints = new Map<string, Set<NodeId>>();
+  /** when we last sent our peer table to each peer (rate-limits the reply) */
+  private lastTableSent = new Map<NodeId, number>();
   private nameService?: NameServiceStore;
   private nsVersion = 0;
 
@@ -196,7 +216,7 @@ export class Conversation {
         this.sendHello(peer.node_id);
         this.mesh?.send(peer.node_id, { t: "SYNC_REQ", chat_vv: this.log.versionVector(), profile_lamport: 0 });
         // §10: exchange peer tables, and share the Name Service records we hold
-        this.mesh?.send(peer.node_id, { t: "PEER_TABLE", peers: this.mesh.peerTable(this.myPeerEntry()) });
+        this.sendPeerTable(peer.node_id);
         const records = this.nameService?.all() ?? [];
         if (records.length) this.mesh?.send(peer.node_id, { t: "NS", records: records.slice(0, 64) });
         void this.persistPeerTable();
@@ -263,6 +283,16 @@ export class Conversation {
           this.mesh?.send(peer, { t: "SYNC_REQ", chat_vv: this.log.versionVector(), profile_lamport: 0 });
         }
       }, ANTI_ENTROPY_MS),
+      // §10.3/§12.1: keep peer tables fresh over the life of a link, not just
+      // at open. Without this, a node whose relays die later never learns the
+      // peers (or the live relay URLs) its neighbours found in the meantime.
+      window.setInterval(() => this.broadcastPeerTable(), PEER_TABLE_INTERVAL_MS),
+      // §12.1: the moment we notice we have NO working relay, ask the mesh
+      // right away rather than waiting for the next scheduled exchange —
+      // peers answer with their table, which carries live relay URLs.
+      window.setInterval(() => {
+        if (this.relaysUp() === 0 && this.connectedCount() > 0) this.broadcastPeerTable(true);
+      }, RELAY_ISOLATION_CHECK_MS),
     );
     this.deps.log(`conversation started: ${this.title}`);
   }
@@ -442,7 +472,7 @@ export class Conversation {
         await this.acceptMembership(msg.pubkey, msg.chain ?? [], msg.nickname);
         if (msg.nickname) this.nicknames.set(from, msg.nickname);
         // §10: swap peer tables right after the channel opens
-        this.mesh.send(from, { t: "PEER_TABLE", peers: this.mesh.peerTable(this.myPeerEntry()) });
+        this.sendPeerTable(from);
         this.deps.onChange(this);
         break;
       }
@@ -455,6 +485,7 @@ export class Conversation {
           if (entry.node_id === this.id.myNodeId) continue;
           if ((await nodeIdFromPubkey(entry.pubkey)) !== entry.node_id) continue; // forged row
           if (this.deps.reputation.isBanned(entry.node_id)) continue;
+          this.noteRelayHints(entry);
           if (this.mesh.introducePeer(entry)) {
             learned++;
             // record it as a candidate so scoring/failover can use it too
@@ -476,6 +507,13 @@ export class Conversation {
           this.deps.log(`peer table from ${from.slice(0, 8)}: ${learned} new peer(s) (chained discovery)`);
           await this.persistPeerTable();
           this.deps.onChange(this);
+        }
+        this.maybeAdoptRelays();
+        // Answer with our own table so the exchange is symmetric — that is how
+        // a relay-isolated peer gets our live relay URLs back. Rate-limited per
+        // peer, so two nodes can't ping-pong tables forever.
+        if (Date.now() - (this.lastTableSent.get(from) ?? 0) >= PEER_TABLE_REPLY_MIN_MS) {
+          this.sendPeerTable(from);
         }
         break;
       }
@@ -628,7 +666,73 @@ export class Conversation {
       last_seen: nowSeconds(),
       capabilities: MY_CAPABILITIES,
       nickname: this.deps.nickname(),
+      // only advertise relays we are actually talking to, so a dead URL isn't
+      // propagated across the mesh forever
+      relays: (this.pool?.connectedUrls() ?? []).slice(0, MAX_ADVERTISED_RELAYS),
     };
+  }
+
+  /** Send our peer table to one peer, remembering when (rate-limit source). */
+  private sendPeerTable(to: NodeId, row = this.myPeerEntry()): void {
+    if (!this.mesh) return;
+    this.lastTableSent.set(to, Date.now());
+    this.mesh.send(to, { t: "PEER_TABLE", peers: this.mesh.peerTable(row) });
+  }
+
+  /**
+   * Push our peer table to every peer. Peers answer with theirs (rate-limited),
+   * so this doubles as "tell me what you know" — which is how a relay-isolated
+   * node gets a live relay URL back (§12.1).
+   */
+  private broadcastPeerTable(force = false): void {
+    if (!this.mesh) return;
+    const row = this.myPeerEntry();
+    const now = Date.now();
+    for (const peer of this.mesh.connectedNodeIds()) {
+      if (!force && now - (this.lastTableSent.get(peer) ?? 0) < PEER_TABLE_REPLY_MIN_MS) continue;
+      this.sendPeerTable(peer, row);
+    }
+  }
+
+  /** Remember which peer advertised which relay (§12.1). */
+  private noteRelayHints(entry: PeerTableEntry): void {
+    if (!Array.isArray(entry.relays)) return;
+    for (const raw of entry.relays.slice(0, MAX_ADVERTISED_RELAYS)) {
+      const url = normalizeRelayUrl(raw);
+      if (!url) continue;
+      let peers = this.relayHints.get(url);
+      if (!peers) this.relayHints.set(url, (peers = new Set()));
+      peers.add(entry.node_id);
+    }
+  }
+
+  /**
+   * §12.1 relay failover over the mesh: when every relay we know is down, take
+   * a relay URL advertised by a peer we already hold an authenticated WebRTC
+   * link to. Deliberately narrow:
+   *  - only while relaysUp() === 0, i.e. discovery is already broken
+   *  - purely additive, our own relays stay and keep retrying
+   *  - bounded, and every event is still verified locally, so an adopted relay
+   *    can withhold events but never forge them
+   */
+  private maybeAdoptRelays(): void {
+    if (!this.pool || this.relaysUp() > 0) return;
+    const adopt = selectRelayHints(this.relayHints, { known: this.spec.relays, quorum: 1 });
+    for (const url of adopt) {
+      this.spec.relays = [...this.spec.relays, url];
+      this.pool.addRelay(url);
+      this.deps.log(`adopted relay from a peer (all relays were down): ${url}`);
+      this.deps.onRelayAdopted?.(url);
+    }
+    if (adopt.length) this.deps.onChange(this);
+  }
+
+  /** Add a relay to the live pool without restarting the conversation. */
+  addRelayLive(url: string): void {
+    const norm = normalizeRelayUrl(url);
+    if (!norm || this.spec.relays.includes(norm)) return;
+    this.spec.relays = [...this.spec.relays, norm];
+    this.pool?.addRelay(norm);
   }
 
   /** §13: the peer table survives reloads, so a returning node has candidates

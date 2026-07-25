@@ -81,6 +81,7 @@ ANP_PUBLIC_HOST=chat.example.com ANP_HTTPS_PORT=443 \
 | `npm test` | ユニット + Relay 統合テスト（80件、要 `npm install`） |
 | `npm run test:e2e` | 実ブラウザE2E（チャンネル自動探索 + 暗号DM、要 Chromium） |
 | `npm run test:e2e:multirelay` | Relay 2台での実ブラウザE2E（Relay多様性 §8.3 / Relay 1台停止での継続 §12.1） |
+| `npm run test:e2e:relayadopt` | Relayが全滅したノードがメッシュ経由で生きているRelayを学習する検証（§12.1） |
 
 環境変数: `PORT`（既定8787）/ `ANP_HTTPS_PORT`（既定 `PORT+1`）/ `ANP_PUBLIC_HOST`（公開IP/ドメイン）/ `ANP_TLS_CERT`・`ANP_TLS_KEY`（正規証明書の持ち込み）/ `HOST` / `ANP_POW_BITS` / `ANP_TRUST_PROXY`（プロキシ背後で1・その場合内蔵httpsは自動オフ）/ `ANP_OPEN`（1でブラウザ自動起動）/ `ANP_HTTPS`（0で内蔵https/QRを無効）/ `ANP_PUBLIC_DIR`。
 
@@ -121,15 +122,16 @@ test/          ユニット80件 + 実ブラウザE2E
 | **§8 候補スコアリング（invite/freshness/heartbeat/relay多様性/latency）** | **`shared/discovery.ts`（純粋関数・単体テスト済み）** |
 | **§8.3 Step5 決定的選択（同点は Node ID 辞書順、乱択しない）** | `rankCandidates` / `selectCandidate`（入力順に依存しないことをテストで保証）。**スコア順は実際の接続順序に反映**（`Mesh.setPriority`） |
 | §9 WebRTC（Relayをシグナリングに使用・Offer/Answer/ICE） | `webrtc.ts`（SIGNALはECIESで暗号化・Trickle ICE） |
-| **§10.1 Peer Table（`capabilities`・`latency_hint`）** | `PEER_TABLE` メッセージ。latencyはPING/PONGのRTTを指数平滑で計測 |
+| **§10.1 Peer Table（`capabilities`・`latency_hint`・使用中Relay）** | `PEER_TABLE` メッセージ。latencyはPING/PONGのRTTを指数平滑で計測。接続直後だけでなく45秒毎に交換し直す |
 | **§10.3 連鎖的発見（Relay依存を薄める）** | `introducePeer`：Relayで見ていないノードをPeer Table経由で採用 |
 | §1.5 育つほどRelay依存が減る | 直結が3以上でHEARTBEAT間隔を半減（`relayIndependent()`） |
 | §11 Name Service（`bootstrap`/`service/*` をDNS的に解決） | `conversation.ts` が署名付きレコードを複製し `resolve()`/`serviceNodes()` を提供 |
 | §12 失敗時（Relayフェイルオーバー・候補送り・再シグナリング・0人なら自分が最初） | 複数Relay + 送信キュー。**リンクが落ちると空いた枠に次点候補を昇格**（`fillSlots`）、指数バックオフで再シグナリング、候補0なら自分のJOINで開始 |
+| **§12.1 Relayが全滅した場合** | Peer Table が「自分が今つながっている Relay URL」も運ぶ。**自分のRelayが全滅した時だけ**、直結済みピアが広告するRelayを採用する（既存Relayは残したまま追加のみ／ws・wss以外や認証情報付きURLは拒否／総数8まで／全イベントはローカル検証なので偽造は不可） |
 | §13 ローカル保存（鍵・証明書・Peer Table・NSレコード・CRDT） | IndexedDB（`peers`/`ns`/`crdt`/`kv`、Peer Tableは再起動後の初期候補になる） |
 | §14 セキュリティ（招待制・署名・TTL・重複JOIN抑制・レピュテーション） | 全イベント署名必須、TTL、Relayのper-node上限、`reputation.ts` |
 
-**メッシュ次数の上限**: 大人数チャンネルが N² 接続にならないよう、自分から張るリンクは最大8（受け入れ含め最大16）。枠はスコア上位から埋め、直結していない相手へはゴシップ（CRDT delta 転送 + 定期 anti-entropy）でメッセージが届きます。設定→「探索状況」でスコア順の候補一覧・直結数・Relay依存度を確認できます。
+**メッシュ次数の上限**: 大人数チャンネルが N² 接続にならないよう、自分から張るリンクは最大8（受け入れ含め最大16）。枠はスコア上位から埋め、直結していない相手へはゴシップ（CRDT delta 転送 + 定期 anti-entropy）でメッセージが届きます。設定→「探索状況」でスコア順の候補一覧・直結数・Relay依存度・Relay多様性（各候補を何台のRelayが報告しているか）を確認できます。
 
 > 補足: 現在の既定UIはチャンネル/DM（オープンルーム）なので、§5の招待制は「招待制ネットワーク」を選んだ場合に適用されます。招待チェーン・失効・権限委譲の実装はそのまま有効です。
 
@@ -219,7 +221,8 @@ DataChannel を確立した SDP は宛先ノード鍵に暗号化されている
 
 ## 検証
 
-- `npm test`: 80件 — 暗号（ECIES・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、**オープンルーム（room束縛JOIN・招待網侵入不可・PoW必須）**、**DM（共有鍵の対称性・第三者は復号/参加不可）**、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/著者別失効/squat防止/再ゴシップ抑止）、信頼スコア、Relay統合（メンバーシップゲート/不正イベント耐性）
+- `npm test`: 83件 — 暗号（ECIES・PoW）、証明書チェーン（偽造/期限/失効/昇格/長さ）、**オープンルーム（room束縛JOIN・招待網侵入不可・PoW必須）**、**DM（共有鍵の対称性・第三者は復号/参加不可）**、イベント（改ざん/リプレイ/期限）、CRDT（収束/VV/エポック/署名）、NS（決定的マージ/著者別失効/squat防止/再ゴシップ抑止）、信頼スコア、Relay統合（メンバーシップゲート/不正イベント耐性）
 - `npm run test:e2e`: 実ブラウザ — **表示名だけで #general に自動参加→自動探索→WebRTC接続**、チャンネル双方向チャット、CID検証ファイル転送、**ECDH暗号DMの双方向同期**、共有リンクからのチャンネル参加。スマホ(390px)/PC 両ビューポートでスクリーンショット確認済み
 - `npm run test:e2e:multirelay`: 実ブラウザ・Relay2台 — 同一ノードが**2台のRelayから別々に観測される**こと（探索スコア §8.3 のRelay多様性項が実際に加点されること）を設定画面の「Relay多様性」表示で検証し、続けて**Relayを1台強制停止**してもチャットと新規ノードの探索が生き残ること（§12.1 フェイルオーバー）を確認
+- `npm run test:e2e:relayadopt`: 実ブラウザ — AliceはRelay A+B、BobはRelay Aのみ。両者が接続したあと**Relay Aを強制停止**すると Bob は Relay ゼロになるが、Alice の Peer Table から Relay B を学習して採用し、**Relay Bしか知らない新規ノードから Bob に到達できる**ところまで確認
 - 4ラウンドの敵対的監査（AIエージェントによる多次元レビュー＋反証検証）を実施し、各ラウンドの確認済み欠陥をすべて修正（クリティカル: Relayクラッシュ、失効un-revoke攻撃、NSゴシップ無限ストーム、**Relay多様性項の死蔵**（重複イベントが id で握り潰され `relay_count` が常に1だった） 等）

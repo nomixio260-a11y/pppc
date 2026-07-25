@@ -763,6 +763,33 @@ function selectConnectTargets(ranked, opts) {
   }
   return out;
 }
+var MAX_ADVERTISED_RELAYS = 4;
+var MAX_TOTAL_RELAYS = 8;
+function normalizeRelayUrl(raw) {
+  if (typeof raw !== "string" || raw.length > 200) return void 0;
+  let u;
+  try {
+    u = new URL(raw.trim());
+  } catch {
+    return void 0;
+  }
+  if (u.protocol !== "ws:" && u.protocol !== "wss:") return void 0;
+  if (u.username || u.password) return void 0;
+  if (!u.hostname) return void 0;
+  u.hash = "";
+  const path = u.pathname === "/" ? "" : u.pathname.replace(/\/$/, "");
+  return `${u.protocol}//${u.host}${path}${u.search}`;
+}
+function selectRelayHints(hints, opts) {
+  const known = /* @__PURE__ */ new Set();
+  for (const url of opts.known) {
+    const n = normalizeRelayUrl(url);
+    if (n) known.add(n);
+  }
+  const room = (opts.max ?? MAX_TOTAL_RELAYS) - known.size;
+  if (room <= 0) return [];
+  return [...hints.entries()].filter(([url, peers]) => peers.size >= opts.quorum && !known.has(url)).sort((a, b) => b[1].size - a[1].size || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, room).map(([url]) => url);
+}
 
 // src/shared/nameservice.ts
 var REVOKED_PREFIX = "revoked/";
@@ -935,6 +962,11 @@ var RelayPool = class {
     let n = 0;
     for (const conn of this.conns.values()) if (conn.stats.connected) n++;
     return n;
+  }
+  /** URLs of relays that are up right now — what we advertise to peers so a
+   * relay-isolated node can learn a working one (§12.1). */
+  connectedUrls() {
+    return [...this.conns.values()].filter((c) => c.stats.connected).map((c) => c.url);
   }
   statsSnapshot() {
     return [...this.conns.values()].map((c) => ({ ...c.stats }));
@@ -1720,6 +1752,9 @@ var FileService = class {
 
 // src/client/conversation.ts
 var ANTI_ENTROPY_MS = 6e4;
+var PEER_TABLE_INTERVAL_MS = 45e3;
+var RELAY_ISOLATION_CHECK_MS = 5e3;
+var PEER_TABLE_REPLY_MIN_MS = 1e4;
 var MAX_ENTRIES_PER_DELTA = 512;
 var MY_CAPABILITIES = ["chat", "store", "nameservice"];
 var RELAY_INDEPENDENCE_AT = 3;
@@ -1749,6 +1784,10 @@ var Conversation = class {
   candidates = /* @__PURE__ */ new Map();
   /** which relays reported each candidate — feeds the diversity score */
   candidateRelays = /* @__PURE__ */ new Map();
+  /** relay URLs advertised by peers -> who advertised them (§12.1 failover) */
+  relayHints = /* @__PURE__ */ new Map();
+  /** when we last sent our peer table to each peer (rate-limits the reply) */
+  lastTableSent = /* @__PURE__ */ new Map();
   nameService;
   nsVersion = 0;
   get networkId() {
@@ -1798,7 +1837,7 @@ var Conversation = class {
         this.deps.reputation.record(peer.node_id, "connect");
         this.sendHello(peer.node_id);
         this.mesh?.send(peer.node_id, { t: "SYNC_REQ", chat_vv: this.log.versionVector(), profile_lamport: 0 });
-        this.mesh?.send(peer.node_id, { t: "PEER_TABLE", peers: this.mesh.peerTable(this.myPeerEntry()) });
+        this.sendPeerTable(peer.node_id);
         const records = this.nameService?.all() ?? [];
         if (records.length) this.mesh?.send(peer.node_id, { t: "NS", records: records.slice(0, 64) });
         void this.persistPeerTable();
@@ -1859,7 +1898,17 @@ var Conversation = class {
           const peer = peers[Math.floor(Math.random() * peers.length)];
           this.mesh?.send(peer, { t: "SYNC_REQ", chat_vv: this.log.versionVector(), profile_lamport: 0 });
         }
-      }, ANTI_ENTROPY_MS)
+      }, ANTI_ENTROPY_MS),
+      // §10.3/§12.1: keep peer tables fresh over the life of a link, not just
+      // at open. Without this, a node whose relays die later never learns the
+      // peers (or the live relay URLs) its neighbours found in the meantime.
+      window.setInterval(() => this.broadcastPeerTable(), PEER_TABLE_INTERVAL_MS),
+      // §12.1: the moment we notice we have NO working relay, ask the mesh
+      // right away rather than waiting for the next scheduled exchange —
+      // peers answer with their table, which carries live relay URLs.
+      window.setInterval(() => {
+        if (this.relaysUp() === 0 && this.connectedCount() > 0) this.broadcastPeerTable(true);
+      }, RELAY_ISOLATION_CHECK_MS)
     );
     this.deps.log(`conversation started: ${this.title}`);
   }
@@ -2016,7 +2065,7 @@ var Conversation = class {
         if (await nodeIdFromPubkey(msg.pubkey) !== from) return;
         await this.acceptMembership(msg.pubkey, msg.chain ?? [], msg.nickname);
         if (msg.nickname) this.nicknames.set(from, msg.nickname);
-        this.mesh.send(from, { t: "PEER_TABLE", peers: this.mesh.peerTable(this.myPeerEntry()) });
+        this.sendPeerTable(from);
         this.deps.onChange(this);
         break;
       }
@@ -2027,6 +2076,7 @@ var Conversation = class {
           if (entry.node_id === this.id.myNodeId) continue;
           if (await nodeIdFromPubkey(entry.pubkey) !== entry.node_id) continue;
           if (this.deps.reputation.isBanned(entry.node_id)) continue;
+          this.noteRelayHints(entry);
           if (this.mesh.introducePeer(entry)) {
             learned++;
             this.candidates.set(entry.node_id, {
@@ -2047,6 +2097,10 @@ var Conversation = class {
           this.deps.log(`peer table from ${from.slice(0, 8)}: ${learned} new peer(s) (chained discovery)`);
           await this.persistPeerTable();
           this.deps.onChange(this);
+        }
+        this.maybeAdoptRelays();
+        if (Date.now() - (this.lastTableSent.get(from) ?? 0) >= PEER_TABLE_REPLY_MIN_MS) {
+          this.sendPeerTable(from);
         }
         break;
       }
@@ -2183,8 +2237,69 @@ var Conversation = class {
       pubkey: this.id.pubkeyHex,
       last_seen: nowSeconds(),
       capabilities: MY_CAPABILITIES,
-      nickname: this.deps.nickname()
+      nickname: this.deps.nickname(),
+      // only advertise relays we are actually talking to, so a dead URL isn't
+      // propagated across the mesh forever
+      relays: (this.pool?.connectedUrls() ?? []).slice(0, MAX_ADVERTISED_RELAYS)
     };
+  }
+  /** Send our peer table to one peer, remembering when (rate-limit source). */
+  sendPeerTable(to, row = this.myPeerEntry()) {
+    if (!this.mesh) return;
+    this.lastTableSent.set(to, Date.now());
+    this.mesh.send(to, { t: "PEER_TABLE", peers: this.mesh.peerTable(row) });
+  }
+  /**
+   * Push our peer table to every peer. Peers answer with theirs (rate-limited),
+   * so this doubles as "tell me what you know" — which is how a relay-isolated
+   * node gets a live relay URL back (§12.1).
+   */
+  broadcastPeerTable(force = false) {
+    if (!this.mesh) return;
+    const row = this.myPeerEntry();
+    const now = Date.now();
+    for (const peer of this.mesh.connectedNodeIds()) {
+      if (!force && now - (this.lastTableSent.get(peer) ?? 0) < PEER_TABLE_REPLY_MIN_MS) continue;
+      this.sendPeerTable(peer, row);
+    }
+  }
+  /** Remember which peer advertised which relay (§12.1). */
+  noteRelayHints(entry) {
+    if (!Array.isArray(entry.relays)) return;
+    for (const raw of entry.relays.slice(0, MAX_ADVERTISED_RELAYS)) {
+      const url = normalizeRelayUrl(raw);
+      if (!url) continue;
+      let peers = this.relayHints.get(url);
+      if (!peers) this.relayHints.set(url, peers = /* @__PURE__ */ new Set());
+      peers.add(entry.node_id);
+    }
+  }
+  /**
+   * §12.1 relay failover over the mesh: when every relay we know is down, take
+   * a relay URL advertised by a peer we already hold an authenticated WebRTC
+   * link to. Deliberately narrow:
+   *  - only while relaysUp() === 0, i.e. discovery is already broken
+   *  - purely additive, our own relays stay and keep retrying
+   *  - bounded, and every event is still verified locally, so an adopted relay
+   *    can withhold events but never forge them
+   */
+  maybeAdoptRelays() {
+    if (!this.pool || this.relaysUp() > 0) return;
+    const adopt = selectRelayHints(this.relayHints, { known: this.spec.relays, quorum: 1 });
+    for (const url of adopt) {
+      this.spec.relays = [...this.spec.relays, url];
+      this.pool.addRelay(url);
+      this.deps.log(`adopted relay from a peer (all relays were down): ${url}`);
+      this.deps.onRelayAdopted?.(url);
+    }
+    if (adopt.length) this.deps.onChange(this);
+  }
+  /** Add a relay to the live pool without restarting the conversation. */
+  addRelayLive(url) {
+    const norm = normalizeRelayUrl(url);
+    if (!norm || this.spec.relays.includes(norm)) return;
+    this.spec.relays = [...this.spec.relays, norm];
+    this.pool?.addRelay(norm);
   }
   /** §13: the peer table survives reloads, so a returning node has candidates
    * before any relay answers. */
@@ -2375,6 +2490,7 @@ function deps() {
     onActivity: (c) => {
       if (c.networkId !== activeId) renderConvList();
     },
+    onRelayAdopted: (url) => void adoptRelay(url),
     log
   };
 }
@@ -2575,6 +2691,14 @@ async function addRelay(url) {
   renderRelays();
   await rejoinAll();
   toast("Relay\u3092\u8FFD\u52A0\u3057\u307E\u3057\u305F\u3002\u518D\u63A5\u7D9A\u3057\u307E\u3059", "ok");
+}
+async function adoptRelay(url) {
+  if (relays.includes(url)) return;
+  relays = [...relays, url];
+  await store.put("kv", "relays", relays);
+  for (const c of conversations.values()) c.addRelayLive(url);
+  renderRelays();
+  toast(`\u30D4\u30A2\u304B\u3089\u751F\u304D\u3066\u3044\u308BRelay\u3092\u5B66\u7FD2\u3057\u307E\u3057\u305F: ${url}`, "ok");
 }
 async function removeRelay(url) {
   relays = relays.filter((r) => r !== url);
